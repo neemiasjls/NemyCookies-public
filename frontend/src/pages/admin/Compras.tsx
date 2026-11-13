@@ -1,0 +1,321 @@
+import { hoje, dataBR as dataBR0 } from '../../data'
+import { useEffect, useState } from 'react'
+import { getCompras, salvarCompra, excluirCompra, criarCategoriaCompra } from '../../api/api'
+import { ListaCompras, Compra, CategoriaCompra, CategoriaCompraInfo, CorCategoria, ItemCompra } from '../../types'
+import { Loader2, Plus, Trash2, Pencil, ShoppingCart, Fuel, X } from 'lucide-react'
+import CampoComSugestoes from '../../components/CampoComSugestoes'
+
+const brl = (v: number) => `R$ ${v.toFixed(2).replace('.', ',')}`
+const dataBR = (iso?: string) => dataBR0(iso, '—')
+
+/** cor guardada no banco -> classes do selo e da bolinha de escolher */
+const CORES: Record<CorCategoria, { selo: string; bolinha: string }> = {
+  marrom:   { selo: 'text-brand bg-brand-soft border-brand-line',   bolinha: 'bg-brand' },
+  azul:     { selo: 'text-info bg-info-bg border-info-line',        bolinha: 'bg-info' },
+  roxo:     { selo: 'text-accent bg-accent-bg border-accent-line',  bolinha: 'bg-accent' },
+  amarelo:  { selo: 'text-warn bg-warn-bg border-warn-line',        bolinha: 'bg-warn' },
+  verde:    { selo: 'text-success bg-success-bg border-success-line', bolinha: 'bg-success' },
+  vermelho: { selo: 'text-danger bg-danger-bg border-danger-line',  bolinha: 'bg-danger' },
+  cinza:    { selo: 'text-ink-2 bg-surface-2 border-line',          bolinha: 'bg-ink-3' },
+}
+
+/** as 6 de fabrica, usadas so enquanto a lista do banco nao chega */
+const PADRAO: CategoriaCompraInfo[] = [
+  { slug: 'ingrediente', label: 'Ingrediente', cor: 'marrom' },
+  { slug: 'embalagem',   label: 'Embalagem',   cor: 'azul' },
+  { slug: 'descartavel', label: 'Descartável', cor: 'cinza' },
+  { slug: 'equipamento', label: 'Equipamento', cor: 'roxo' },
+  { slug: 'marketing',   label: 'Marketing',   cor: 'amarelo' },
+  { slug: 'outro',       label: 'Outro',       cor: 'cinza' },
+]
+
+type LinhaItem = { item: string; quantity: string; unit: string }
+type Rascunho = {
+  id?: number; boughtAt: string; itens: LinhaItem[]
+  amount: string; market: string; category: CategoriaCompra
+}
+const linhaVazia = (): LinhaItem => ({ item: '', quantity: '', unit: '' })
+const vazio = (): Rascunho => ({
+  id: undefined, boughtAt: hoje(), itens: [linhaVazia()],
+  amount: '', market: '', category: 'ingrediente',
+})
+/** "Farinha 2 · 1kg" */
+const descreve = (p: ItemCompra) =>
+  [p.item, p.quantity && `${p.quantity}${p.unit ? ` · ${p.unit}` : ''}`].filter(Boolean).join(' ')
+
+/**
+ * Tudo que sai do bolso: ingrediente, embalagem, descartavel, equipamento e anuncio.
+ * A categoria importa: so ingrediente e embalagem viram custo do cookie;
+ * anuncio, equipamento e as categorias criadas pelo dono entram no lucro, nao no preco.
+ */
+export default function Compras() {
+  const [d, setD] = useState<ListaCompras | null>(null)
+  const [carregando, setCarregando] = useState(true)
+  const [filtro, setFiltro] = useState<CategoriaCompra | null>(null)
+  const [form, setForm] = useState<Rascunho | null>(null)
+  const [salvando, setSalvando] = useState(false)
+  const [novaCat, setNovaCat] = useState<{ label: string; cor: CorCategoria } | null>(null)
+
+  const categorias = d?.categorias?.length ? d.categorias : PADRAO
+  const catDe = (v: string) => {
+    const c = categorias.find((k) => k.slug === v)
+    return { label: c?.label ?? v, cor: CORES[c?.cor ?? 'cinza'].selo }
+  }
+
+  const criarCategoria = async () => {
+    if (!novaCat) return
+    if (!novaCat.label.trim()) return alert('Diga o nome da categoria')
+    try {
+      const c = await criarCategoriaCompra({ label: novaCat.label.trim(), cor: novaCat.cor })
+      setNovaCat(null)
+      // ja deixa a nova escolhida na compra que esta sendo registrada
+      if (form) setForm({ ...form, category: c.slug })
+      await carregar()
+    } catch (e) { alert(e instanceof Error ? e.message : 'Erro ao criar categoria') }
+  }
+
+  const carregar = async (cat = filtro) => {
+    setCarregando(true)
+    try { setD(await getCompras(cat ?? undefined)) } finally { setCarregando(false) }
+  }
+  useEffect(() => { carregar(filtro) }, [filtro])
+
+  const gravar = async () => {
+    if (!form) return
+    const v = Number(form.amount.replace(',', '.'))
+    const itens: ItemCompra[] = form.itens
+      .filter((l) => l.item.trim())
+      .map((l) => ({ item: l.item.trim(), quantity: l.quantity.trim() || null, unit: l.unit.trim() || null }))
+    if (!itens.length) return alert('Diga o que foi comprado')
+    if (!Number.isFinite(v) || v < 0) return alert('Valor inválido')
+    setSalvando(true)
+    try {
+      await salvarCompra({
+        id: form.id, boughtAt: form.boughtAt || undefined, items: itens,
+        amount: v, market: form.market || undefined, category: form.category,
+      })
+      setForm(null); await carregar()
+    } catch (e) { alert(e instanceof Error ? e.message : 'Erro ao salvar') }
+    finally { setSalvando(false) }
+  }
+
+  const editar = (c: Compra) => setForm({
+    id: c.id, boughtAt: c.boughtAt ?? '',
+    itens: (c.produtos?.length ? c.produtos : [{ item: c.item, quantity: c.quantity, unit: c.unit }])
+      .map((p) => ({ item: p.item, quantity: p.quantity ?? '', unit: p.unit ?? '' })),
+    amount: String(c.amount).replace('.', ','),
+    market: c.market ?? '', category: c.category,
+  })
+
+  const apagar = async (c: Compra) => {
+    if (!confirm(`Excluir "${c.item}" de ${brl(c.amount)}?`)) return
+    try { await excluirCompra(c.id); await carregar() }
+    catch (e) { alert(e instanceof Error ? e.message : 'Erro ao excluir') }
+  }
+
+  return (
+    <div className="space-y-4">
+      {/* Total e quebra por categoria */}
+      <div className="bg-surface rounded-xl border border-line p-4 shadow-card">
+        <div className="flex items-center justify-between mb-3">
+          <h3 className="font-display font-bold text-ink flex items-center gap-2">
+            <ShoppingCart size={17} className="text-brand" /> Compras e gastos
+          </h3>
+          <div className="text-right">
+            <p className="text-lg font-bold text-ink tabular-nums">{brl(d?.totalGeral ?? 0)}</p>
+            <p className="text-[11px] text-ink-3 tabular-nums">
+              {d?.quantas ?? 0} compras
+              {d?.combustivel ? ` + ${brl(d.combustivel)} de combustível` : ''}
+            </p>
+          </div>
+        </div>
+        <div className="flex flex-wrap gap-1.5">
+          <button onClick={() => setFiltro(null)}
+            className={`h-8 px-3 rounded-full text-xs font-semibold border transition-colors ${
+              filtro === null ? 'bg-brand text-brand-ink border-brand' : 'text-ink-2 border-line hover:border-brand'
+            }`}>
+            Tudo
+          </button>
+          {(d?.porCategoria ?? []).map((c) => (
+            <button key={c.category} onClick={() => setFiltro(filtro === c.category ? null : c.category)}
+              className={`h-8 px-3 rounded-full text-xs font-semibold border transition-colors ${
+                filtro === c.category ? 'bg-brand text-brand-ink border-brand' : `${catDe(c.category).cor} hover:opacity-80`
+              }`}>
+              {catDe(c.category).label}
+              <span className="ml-1.5 tabular-nums opacity-70">{brl(c.total)}</span>
+            </button>
+          ))}
+          {/* Combustivel nao e linha de compra: e a soma do que voce gastou para
+              entregar, que fica registrada em cada venda. */}
+          {!!d?.combustivel && (
+            <span
+              title={`Somado de ${d.entregasComGasto} entregas com gasto anotado. Para mudar, edite a venda na aba Vendas.`}
+              className="h-8 px-3 rounded-full text-xs font-semibold border border-dashed border-line text-ink-2 inline-flex items-center gap-1.5 cursor-help">
+              <Fuel size={13} className="text-ink-3" />
+              Combustível
+              <span className="tabular-nums opacity-70">{brl(d.combustivel)}</span>
+            </span>
+          )}
+          {!novaCat && (
+            <button onClick={() => setNovaCat({ label: '', cor: 'verde' })}
+              className="h-8 px-3 rounded-full text-xs font-semibold border border-dashed border-line text-ink-3 hover:text-brand hover:border-brand inline-flex items-center gap-1 transition-colors">
+              <Plus size={13} /> Categoria
+            </button>
+          )}
+        </div>
+
+        {novaCat && (
+          <div className="mt-3 pt-3 border-t border-line-soft flex flex-wrap items-center gap-2 animate-fade-up">
+            <input autoFocus value={novaCat.label} maxLength={30}
+              onChange={(e) => setNovaCat({ ...novaCat, label: e.target.value })}
+              onKeyDown={(e) => { if (e.key === 'Enter') criarCategoria(); if (e.key === 'Escape') setNovaCat(null) }}
+              placeholder="nome da categoria"
+              className="flex-1 min-w-[150px] text-sm border border-line rounded-lg px-3 h-9 bg-surface text-ink" />
+            <div className="flex items-center gap-1.5" role="radiogroup" aria-label="Cor">
+              {(Object.keys(CORES) as CorCategoria[]).map((c) => (
+                <button key={c} onClick={() => setNovaCat({ ...novaCat, cor: c })}
+                  role="radio" aria-checked={novaCat.cor === c} aria-label={c} title={c}
+                  className={`w-6 h-6 rounded-full ${CORES[c].bolinha} transition-transform ${
+                    novaCat.cor === c ? 'ring-2 ring-offset-2 ring-offset-surface ring-ink scale-110' : 'opacity-70 hover:opacity-100'
+                  }`} />
+              ))}
+            </div>
+            <span className={`text-xs font-semibold px-3 h-8 inline-flex items-center rounded-full border ${CORES[novaCat.cor].selo}`}>
+              {novaCat.label.trim() || 'prévia'}
+            </span>
+            <div className="flex items-center gap-1 ml-auto">
+              <button onClick={() => setNovaCat(null)} title="Cancelar"
+                className="text-ink-3 hover:text-ink p-2 rounded-lg transition-colors"><X size={15} /></button>
+              <button onClick={criarCategoria}
+                className="bg-brand hover:bg-brand-strong text-brand-ink font-bold text-sm px-4 h-9 rounded-lg transition-colors">
+                Criar
+              </button>
+            </div>
+          </div>
+        )}
+      </div>
+
+      {!!d?.combustivel && (
+        <p className="text-[11px] text-ink-3 -mt-1 px-1">
+          O combustível vem das entregas ({d.entregasComGasto} com gasto anotado) e não é
+          lançado aqui — cada venda guarda o seu. Para ajustar, edite a venda na aba Vendas.
+        </p>
+      )}
+
+      {/* Formulario */}
+      {form ? (
+        <div className="bg-surface rounded-xl border border-brand-line p-4 shadow-card animate-fade-up">
+          <h4 className="font-display font-bold text-ink text-sm mb-3">
+            {form.id ? 'Editar compra' : 'Nova compra'}
+          </h4>
+          {/* Varios itens, um valor so: o preco e o total pago na compra */}
+          <div className="space-y-2 mb-2">
+            {form.itens.map((l, i) => {
+              const muda = (campo: Partial<LinhaItem>) =>
+                setForm({ ...form, itens: form.itens.map((x, j) => (j === i ? { ...x, ...campo } : x)) })
+              return (
+                <div key={i} className="flex gap-2">
+                  <input value={l.item} onChange={(e) => muda({ item: e.target.value })}
+                    autoFocus={i > 0 && i === form.itens.length - 1 && !l.item}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter' && l.item.trim()) {
+                        e.preventDefault(); setForm({ ...form, itens: [...form.itens, linhaVazia()] })
+                      }
+                    }}
+                    placeholder={i === 0 ? 'o que comprou' : 'outro item'}
+                    className="flex-1 min-w-0 text-sm border border-line rounded-lg px-3 h-10 bg-surface text-ink" />
+                  <input value={l.quantity} onChange={(e) => muda({ quantity: e.target.value })}
+                    placeholder="qtd"
+                    className="w-16 sm:w-24 text-sm border border-line rounded-lg px-3 h-10 bg-surface text-ink" />
+                  <input value={l.unit} onChange={(e) => muda({ unit: e.target.value })}
+                    placeholder="unid. (500g)"
+                    className="w-24 sm:w-36 text-sm border border-line rounded-lg px-3 h-10 bg-surface text-ink" />
+                  {form.itens.length > 1 && (
+                    <button onClick={() => setForm({ ...form, itens: form.itens.filter((_, j) => j !== i) })}
+                      title="Tirar este item" aria-label="Tirar este item"
+                      className="text-ink-3 hover:text-danger transition-colors px-1 flex-shrink-0"><X size={15} /></button>
+                  )}
+                </div>
+              )
+            })}
+            <button onClick={() => setForm({ ...form, itens: [...form.itens, linhaVazia()] })}
+              className="text-xs font-semibold text-ink-2 hover:text-brand inline-flex items-center gap-1 px-1 py-1 transition-colors">
+              <Plus size={13} /> Adicionar item
+            </button>
+          </div>
+          <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+            <input type="date" value={form.boughtAt} onChange={(e) => setForm({ ...form, boughtAt: e.target.value })}
+              className="col-span-1 text-sm border border-line rounded-lg px-2 h-10 bg-surface text-ink" />
+            <input value={form.amount} onChange={(e) => setForm({ ...form, amount: e.target.value })}
+              placeholder={form.itens.length > 1 ? 'R$ total pago' : 'R$ pago'} inputMode="decimal"
+              className="text-sm border border-line rounded-lg px-3 h-10 bg-surface text-ink" />
+            {/* Escolhe da lista ou digita um novo: o mercado novo aparece
+                sozinho na proxima compra, sem botao de cadastrar. */}
+            <CampoComSugestoes
+              valor={form.market}
+              aoMudar={(v) => setForm({ ...form, market: v })}
+              sugestoes={d?.mercados ?? []}
+              placeholder="mercado" />
+            <select value={form.category}
+              onChange={(e) => {
+                if (e.target.value === '__nova') return setNovaCat({ label: '', cor: 'verde' })
+                setForm({ ...form, category: e.target.value as CategoriaCompra })
+              }}
+              className="col-span-2 sm:col-span-4 text-sm border border-line rounded-lg px-3 h-10 bg-surface text-ink">
+              {categorias.map((c) => <option key={c.slug} value={c.slug}>{c.label}</option>)}
+              <option value="__nova">＋ Nova categoria…</option>
+            </select>
+          </div>
+          <div className="flex justify-end gap-2 mt-3">
+            <button onClick={() => setForm(null)}
+              className="text-sm font-semibold text-ink-2 hover:text-ink px-3 py-2 rounded-lg transition-colors">
+              Cancelar
+            </button>
+            <button onClick={gravar} disabled={salvando}
+              className="bg-brand hover:bg-brand-strong text-brand-ink font-bold text-sm px-5 py-2.5 rounded-xl transition-colors disabled:opacity-40">
+              {salvando ? 'Salvando...' : 'Salvar'}
+            </button>
+          </div>
+        </div>
+      ) : (
+        <button onClick={() => setForm(vazio())}
+          className="w-full bg-surface hover:bg-surface-2 border border-dashed border-line hover:border-brand rounded-xl py-3 text-sm font-semibold text-ink-2 hover:text-brand transition-colors flex items-center justify-center gap-1.5">
+          <Plus size={15} /> Registrar compra
+        </button>
+      )}
+
+      {/* Lista */}
+      {carregando ? (
+        <div className="flex justify-center py-10"><Loader2 size={20} className="animate-spin text-brand" /></div>
+      ) : (
+        <div className="bg-surface rounded-xl border border-line shadow-card divide-y divide-line-soft overflow-hidden">
+          {(d?.itens ?? []).map((c) => (
+            <div key={c.id} className="flex items-center gap-2.5 px-3 py-2.5 group">
+              <span className="text-[11px] text-ink-3 tabular-nums w-[68px] flex-shrink-0">{dataBR(c.boughtAt)}</span>
+              <div className="min-w-0 flex-1">
+                <p className="text-sm text-ink truncate" title={c.produtos?.map(descreve).join('\n')}>{c.item}</p>
+                <p className="text-[11px] text-ink-3 truncate">
+                  {[c.produtos?.length ? `${c.produtos.length} itens` : c.quantity && `${c.quantity}${c.unit ? ` · ${c.unit}` : ''}`,
+                    c.market, c.notes].filter(Boolean).join(' · ') || '—'}
+                </p>
+              </div>
+              <span className={`text-[10px] font-semibold px-2 py-0.5 rounded-full border flex-shrink-0 hidden sm:block ${catDe(c.category).cor}`}>
+                {catDe(c.category).label}
+              </span>
+              <span className="text-sm font-bold text-ink tabular-nums flex-shrink-0 w-20 text-right">{brl(c.amount)}</span>
+              <div className="flex items-center gap-1 flex-shrink-0 sm:opacity-0 sm:group-hover:opacity-100 transition-opacity">
+                <button onClick={() => editar(c)} title="Editar"
+                  className="text-ink-3 hover:text-brand transition-colors p-1"><Pencil size={13} /></button>
+                <button onClick={() => apagar(c)} title="Excluir"
+                  className="text-ink-3 hover:text-danger transition-colors p-1"><Trash2 size={13} /></button>
+              </div>
+            </div>
+          ))}
+          {(d?.itens ?? []).length === 0 && (
+            <p className="text-sm text-ink-3 text-center py-8">Nenhuma compra por aqui.</p>
+          )}
+        </div>
+      )}
+    </div>
+  )
+}

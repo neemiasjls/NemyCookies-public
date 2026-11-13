@@ -1,0 +1,653 @@
+import {
+  OrderResponse, OrderStatus, Product, Category,
+  PixPaymentCreatedResponse, TabSale, TabSummaryRow, FechamentoFiado, TabCustomer, Estabelecimento, OrigemVenda, ProductionSummary, Producao,
+  AuditEntry, Custos, ListaCompras, ListaVendas, ResumoFinanceiro, ListaAAnotar,
+  Compra, VendaGeral, CategoriaCompra, CategoriaCompraInfo, CorCategoria, ItemCompra, PainelClientes, ClienteCadastro,TipoVenda, ModoEntrega, FormaPagamento, MetodoPagamento,
+  PainelFidelidade, MovimentoPontos, SaldosFidelidade, ConviteCliente,
+} from '../types'
+
+const SUPABASE_URL = import.meta.env.VITE_SUPABASE_URL
+const SUPABASE_KEY = import.meta.env.VITE_SUPABASE_ANON_KEY
+
+const REST = `${SUPABASE_URL}/rest/v1`
+const FN = `${SUPABASE_URL}/functions/v1`
+
+const baseHeaders = {
+  'Content-Type': 'application/json',
+  apikey: SUPABASE_KEY,
+}
+
+/**
+ * Chamada publica (cardapio e checkout).
+ * IMPORTANTE: usa a chave anon do Supabase. Nunca envie aqui o token do admin —
+ * ele nao e um JWT do Supabase e o banco recusaria com "No suitable key or wrong key type".
+ */
+async function request<T>(url: string, init: RequestInit = {}): Promise<T> {
+  return send<T>(url, init, `Bearer ${SUPABASE_KEY}`)
+}
+
+/** Chamada autenticada do painel admin (Edge Function /admin). */
+async function requestAdmin<T>(url: string, init: RequestInit = {}): Promise<T> {
+  const token = localStorage.getItem('admin_token')
+  return send<T>(url, init, token ? `Bearer ${token}` : `Bearer ${SUPABASE_KEY}`)
+}
+
+async function send<T>(url: string, init: RequestInit, authorization: string): Promise<T> {
+  const res = await fetch(url, {
+    ...init,
+    headers: {
+      ...baseHeaders,
+      Authorization: authorization,
+      ...(init.headers ?? {}),
+    },
+  })
+  const text = await res.text()
+  const data = text ? JSON.parse(text) : null
+  if (!res.ok) throw new Error(data?.error ?? data?.message ?? 'Erro na requisicao')
+  return data as T
+}
+
+// ── Conversao snake_case (Postgres) -> camelCase (app) ──
+/* eslint-disable @typescript-eslint/no-explicit-any */
+const toProduct = (p: any): Product => ({
+  id: p.id,
+  name: p.name,
+  description: p.description ?? '',
+  price: Number(p.price),
+  imageUrl: p.image_url ?? undefined,
+  weight: p.weight ?? undefined,
+  available: p.available,
+  stock: p.stock,
+  category: p.category
+    ? { id: p.category.id, name: p.category.name, description: p.category.description ?? '', displayOrder: p.category.display_order }
+    : { id: p.category_id, name: '', description: '', displayOrder: 1 },
+})
+
+const toOrder = (o: any): OrderResponse => ({
+  id: o.id,
+  customerName: o.customer_name,
+  customerPhone: o.customer_phone,
+  customerEmail: o.customer_email ?? undefined,
+  paymentMethod: o.payment_method,
+  paymentStatus: o.payment_status,
+  status: o.status,
+  totalAmount: Number(o.total_amount),
+  deliveryFee: o.delivery_fee != null ? Number(o.delivery_fee) : undefined,
+  deliveryMethod: o.delivery_method,
+  changeAmount: o.change_amount != null ? Number(o.change_amount) : undefined,
+  notes: o.notes ?? undefined,
+  address: o.address ?? undefined,
+  source: o.source ?? 'site',
+  createdAt: o.created_at,
+  items: (o.items ?? []).map((i: any) => ({
+    productId: i.productId,
+    productName: i.productName,
+    quantity: i.quantity,
+    unitPrice: Number(i.unitPrice),
+    subtotal: Number(i.subtotal),
+  })),
+})
+/* eslint-enable @typescript-eslint/no-explicit-any */
+
+// ── Cardapio (leitura publica direto do Postgres via RLS) ──
+export const getProducts = (): Promise<Product[]> =>
+  request<unknown[]>(`${REST}/products?select=*,category:categories(*)&order=id.asc`)
+    .then((rows) => rows.map(toProduct))
+
+export const getCategories = (): Promise<Category[]> =>
+  request<{ id: number; name: string; description: string; display_order: number }[]>(
+    `${REST}/categories?select=*&order=display_order.asc`,
+  ).then((rows) => rows.map((c) => ({
+    id: c.id, name: c.name, description: c.description ?? '', displayOrder: c.display_order,
+  })))
+
+// ── Checkout ──
+interface AddressFields {
+  rua?: string
+  numero?: string
+  bairro?: string
+  cep?: string
+  deliveryMethod?: 'PICKUP' | 'DELIVERY'
+}
+
+export interface CreatePixPayload extends AddressFields {
+  customerName: string
+  customerPhone: string
+  customerEmail: string
+  customerCpf?: string
+  notes?: string
+  items: { productId: number; quantity: number }[]
+}
+
+export interface CreateCardPayload extends CreatePixPayload {
+  token: string
+  paymentMethodId: string
+  installments?: number
+  issuerId?: string
+}
+
+export interface CreateCashPayload extends AddressFields {
+  customerName: string
+  customerPhone: string
+  notes?: string
+  changeAmount?: number
+  items: { productId: number; quantity: number }[]
+}
+
+const checkout = <T>(body: unknown): Promise<T> =>
+  request<T>(`${FN}/checkout`, { method: 'POST', body: JSON.stringify(body) })
+
+export const createPixPayment = (data: CreatePixPayload): Promise<PixPaymentCreatedResponse> =>
+  checkout<PixPaymentCreatedResponse>({ ...data, paymentMethod: 'PIX' })
+
+export const createCardPayment = (data: CreateCardPayload): Promise<{ status: string; orderId: number; message: string }> =>
+  checkout({ ...data, paymentMethod: 'CARD' })
+
+export const createCashOrder = (data: CreateCashPayload): Promise<OrderResponse> =>
+  checkout<{ order: unknown }>({ ...data, paymentMethod: 'CASH' }).then((r) => toOrder(r.order))
+
+export const getPixStatus = (paymentId: number): Promise<{ status: string; externalReference: string }> =>
+  request<{ status: string; orderId: number | null }>(`${FN}/payment-status?paymentId=${paymentId}`)
+    .then((r) => ({ status: r.status, externalReference: r.orderId ? String(r.orderId) : '' }))
+
+// ── Area da cliente (fidelidade) ──
+// Sessao propria, separada do admin: o token so serve na Edge Function /fidelidade.
+export const FIDELIDADE_TOKEN = 'fidelidade_token'
+
+async function requestCliente<T>(url: string, init: RequestInit = {}): Promise<T> {
+  const token = localStorage.getItem(FIDELIDADE_TOKEN)
+  return send<T>(url, init, token ? `Bearer ${token}` : `Bearer ${SUPABASE_KEY}`)
+}
+
+export const entrarFidelidade = (telefone: string, senha: string): Promise<{ token: string; nome: string }> =>
+  request(`${FN}/fidelidade/login`, { method: 'POST', body: JSON.stringify({ telefone, senha }) })
+
+/** Primeiro nome de quem foi convidada; erro = convite invalido ou vencido. */
+export const getConvite = (codigo: string): Promise<{ nome: string }> =>
+  request(`${FN}/fidelidade/convite${query({ c: codigo })}`)
+
+/** Usa o convite: ela cria a propria senha e ja entra. */
+export const criarSenhaPeloConvite = (codigo: string, telefone: string, senha: string): Promise<{ token: string; nome: string }> =>
+  request(`${FN}/fidelidade/primeiro-acesso`, { method: 'POST', body: JSON.stringify({ codigo, telefone, senha }) })
+
+export const getPainelFidelidade = (): Promise<PainelFidelidade> =>
+  requestCliente<{
+    nome: string; pontos: number; pontos_por_real: number; validade_dias: number
+    vence_em: string | null; a_liberar: number
+    devendo: string; em_aberto: { id: number; data: string; itens: string | null; total: string; pago: string; pontos: number; conta: boolean }[]
+    pix: { chave: string | null; nome: string | null } | null
+    cookies: { product_id: number; nome: string; imagem: string | null; pontos: number }[]
+    extrato: MovimentoPontos[]
+  }>(`${FN}/fidelidade/painel`).then((r) => ({
+    nome: r.nome,
+    pontos: r.pontos,
+    pontosPorReal: Number(r.pontos_por_real),
+    validadeDias: r.validade_dias,
+    venceEm: r.vence_em ?? undefined,
+    aLiberar: r.a_liberar,
+    devendo: Number(r.devendo),
+    emAberto: r.em_aberto.map((c) => ({
+      id: c.id, data: c.data, itens: c.itens ?? '', total: Number(c.total), pago: Number(c.pago),
+      pontos: c.pontos ?? 0, conta: !!c.conta,
+    })),
+    pix: r.pix?.chave ? { chave: r.pix.chave, nome: r.pix.nome ?? '' } : undefined,
+    cookies: r.cookies.map((c) => ({ productId: c.product_id, nome: c.nome, imagem: c.imagem ?? undefined, pontos: c.pontos })),
+    extrato: r.extrato,
+  }))
+
+export const sairFidelidade = (): Promise<{ ok: boolean }> =>
+  requestCliente(`${FN}/fidelidade/sair`, { method: 'POST' })
+
+// ── Admin ──
+export const adminLogin =(username: string, password: string): Promise<{ token: string }> =>
+  request(`${FN}/admin/login`, { method: 'POST', body: JSON.stringify({ username, password }) })
+
+export const getAdminOrders = (status?: OrderStatus): Promise<OrderResponse[]> =>
+  requestAdmin<unknown[]>(`${FN}/admin/orders${status ? `?status=${status}` : ''}`)
+    .then((rows) => rows.map(toOrder))
+
+/** Pedido anotado manualmente no painel (nao veio do site) */
+export const createManualOrder = (data: {
+  customerId: number
+  items: { productId: number; quantity: number }[]
+  notes?: string
+  /** dia do pedido; em branco usa hoje */
+  soldAt?: string
+}): Promise<OrderResponse> =>
+  requestAdmin(`${FN}/admin/orders/manual`, { method: 'POST', body: JSON.stringify(data) })
+    .then(toOrder)
+
+/** Quantos cookies de cada sabor precisam ser feitos */
+export const getProductionSummary = (): Promise<ProductionSummary> =>
+  requestAdmin(`${FN}/admin/orders/production`)
+
+export const updateOrderStatus = (id: number, status: OrderStatus): Promise<OrderResponse> =>
+  requestAdmin(`${FN}/admin/orders/${id}/status`, { method: 'PATCH', body: JSON.stringify({ status }) })
+    .then(toOrder)
+
+export const getAdminProducts = (): Promise<Product[]> =>
+  requestAdmin<unknown[]>(`${FN}/admin/products`).then((rows) => rows.map(toProduct))
+
+export const updateProductStock = (id: number, stock: number): Promise<Product> =>
+  requestAdmin(`${FN}/admin/products/${id}/stock`, { method: 'PATCH', body: JSON.stringify({ stock }) })
+    .then(toProduct)
+
+export const addProductStock = (id: number, quantity: number): Promise<Product> =>
+  requestAdmin(`${FN}/admin/products/${id}/stock/add`, { method: 'PATCH', body: JSON.stringify({ quantity }) })
+    .then(toProduct)
+
+/** Soma ou subtrai unidades do estoque (botoes + e -) */
+export const adjustProductStock = (id: number, delta: number): Promise<Product> =>
+  requestAdmin(`${FN}/admin/products/${id}/stock/adjust`, { method: 'PATCH', body: JSON.stringify({ delta }) })
+    .then(toProduct)
+
+// ── Producao levada para vender ───────────────────────
+/* eslint-disable @typescript-eslint/no-explicit-any */
+const toProducao = (p: any): Producao | null => p ? ({
+  id: p.id,
+  label: p.label ?? undefined,
+  startedAt: p.started_at,
+  itens: (p.itens ?? []).map((i: any) => ({
+    productId: i.product_id,
+    productName: i.product_name,
+    levado: i.levado,
+    vendido: i.vendido,
+    semVenda: Number(i.sem_venda ?? 0),
+    restante: i.restante,
+  })),
+  levado: Number(p.levado ?? 0),
+  vendido: Number(p.vendido ?? 0),
+  semVenda: Number(p.sem_venda ?? 0),
+  restante: Number(p.restante ?? 0),
+}) : null
+/* eslint-enable @typescript-eslint/no-explicit-any */
+
+/** Lote aberto, ou null quando nao tem nenhum */
+export const getProducao = (): Promise<Producao | null> =>
+  requestAdmin(`${FN}/admin/producao`).then(toProducao)
+
+export const abrirProducao = (
+  items: { productId: number; quantity: number }[],
+  label?: string,
+): Promise<Producao | null> =>
+  requestAdmin(`${FN}/admin/producao`, { method: 'POST', body: JSON.stringify({ items, label }) })
+    .then(toProducao)
+
+/** Levou mais alguns (delta > 0) ou tirou (delta < 0) */
+export const ajustarProducao = (productId: number, delta: number): Promise<Producao | null> =>
+  requestAdmin(`${FN}/admin/producao/ajustar`, { method: 'PATCH', body: JSON.stringify({ productId, delta }) })
+    .then(toProducao)
+
+/** Saiu do lote sem virar venda (dei, comeram, descarte); delta < 0 desfaz */
+export const semVendaProducao = (productId: number, delta: number): Promise<Producao | null> =>
+  requestAdmin(`${FN}/admin/producao/sem-venda`, { method: 'PATCH', body: JSON.stringify({ productId, delta }) })
+    .then(toProducao)
+
+export const fecharProducao = (): Promise<{ ok: boolean }> =>
+  requestAdmin(`${FN}/admin/producao/fechar`, { method: 'POST' })
+
+// ── Caderneta (fiado) ─────────────────────────────────
+/* eslint-disable @typescript-eslint/no-explicit-any */
+const toTabSale = (s: any): TabSale => ({
+  id: s.id,
+  customerId: s.customer_id,
+  customerName: s.customer_name,
+  estabelecimentoId: s.estabelecimento_id,
+  estabelecimento: s.estabelecimento ?? undefined,
+  soldAt: s.sold_at,
+  total: Number(s.total),
+  paid: s.paid,
+  paidAt: s.paid_at ?? undefined,
+  paidAmount: Number(s.paid_amount ?? 0),
+  annotated: !!s.annotated,
+  annotatedAt: s.annotated_at ?? undefined,
+  notes: s.notes ?? undefined,
+  fechamentoId: s.fechamento_id ?? undefined,
+  items: (s.items ?? []).map((i: any) => ({
+    productId: i.productId,
+    productName: i.productName,
+    quantity: i.quantity,
+    unitPrice: Number(i.unitPrice),
+    subtotal: Number(i.subtotal),
+  })),
+})
+/* eslint-enable @typescript-eslint/no-explicit-any */
+
+/** open = a receber · to_annotate = pago, falta anotar · annotated = pago e anotado */
+export type TabStatus = 'open' | 'to_annotate' | 'annotated' | 'all'
+
+/** Monta "?a=1&b=2" so com o que foi informado. */
+const query = (p: Record<string, string | number | null | undefined>) => {
+  const q = Object.entries(p).filter(([, v]) => v !== null && v !== undefined && v !== '')
+    .map(([k, v]) => `${k}=${encodeURIComponent(String(v))}`).join('&')
+  return q ? `?${q}` : ''
+}
+
+export const getTabSales = (status: TabStatus = 'open', estabelecimentoId?: number): Promise<TabSale[]> =>
+  requestAdmin<unknown[]>(`${FN}/admin/tab${query({
+    status: status !== 'all' ? status : null, estabelecimento: estabelecimentoId,
+  })}`).then((rows) => rows.map(toTabSale))
+
+export const getTabSummary = (estabelecimentoId?: number): Promise<TabSummaryRow[]> =>
+  requestAdmin<{ customer_id: number; customer_name: string; nickname: string | null; estabelecimento_id: number; phone: string | null; devendo: string; vendas_abertas: number; devendo_fechado: string; vendas_fechadas: number; total_geral: string; ultima_compra: string; message: string | null }[]>(
+    `${FN}/admin/tab/summary${query({ estabelecimento: estabelecimentoId })}`,
+  ).then((rows) => rows.map((r) => ({
+    customerId: r.customer_id,
+    customerName: r.customer_name,
+    nickname: r.nickname ?? undefined,
+    estabelecimentoId: r.estabelecimento_id,
+    phone: r.phone ?? undefined,
+    devendo: Number(r.devendo),
+    vendasAbertas: r.vendas_abertas,
+    devendoFechado: Number(r.devendo_fechado ?? 0),
+    vendasFechadas: Number(r.vendas_fechadas ?? 0),
+    totalGeral: Number(r.total_geral),
+    ultimaCompra: r.ultima_compra,
+    message: r.message ?? '',
+  })))
+
+/* eslint-disable @typescript-eslint/no-explicit-any */
+const toFechamento = (f: any): FechamentoFiado | null => f ? ({
+  id: f.id, fechadoEm: f.fechado_em, vendas: Number(f.vendas), total: Number(f.total),
+}) : null
+/* eslint-enable @typescript-eslint/no-explicit-any */
+
+/** Ultimo fechamento do fiado do estabelecimento; null se nunca fechou */
+export const getFechamentoFiado = (estabelecimentoId: number): Promise<FechamentoFiado | null> =>
+  requestAdmin(`${FN}/admin/fiado/fechamento${query({ estabelecimento: estabelecimentoId })}`).then(toFechamento)
+
+/** Fecha o que esta em aberto: vai para a cobranca; o vendido depois fica para o proximo */
+export const fecharFiado = (estabelecimentoId: number): Promise<FechamentoFiado | null> =>
+  requestAdmin(`${FN}/admin/fiado/fechamento`, { method: 'POST', body: JSON.stringify({ estabelecimentoId }) })
+    .then(toFechamento)
+
+// ── Estabelecimentos de fiado (nomes so no banco) ──
+export const getEstabelecimentos = (): Promise<Estabelecimento[]> =>
+  requestAdmin<{ id: number; nome: string; principal: boolean; clientes: number; a_receber: string }[]>(
+    `${FN}/admin/fiado/estabelecimentos`,
+  ).then((rows) => rows.map((r) => ({
+    id: r.id, nome: r.nome, principal: r.principal,
+    clientes: Number(r.clientes), aReceber: Number(r.a_receber),
+  })))
+
+export const criarEstabelecimento = (nome: string): Promise<{ id: number; nome: string }> =>
+  requestAdmin(`${FN}/admin/fiado/estabelecimentos`, { method: 'POST', body: JSON.stringify({ nome }) })
+
+export const renomearEstabelecimento = (id: number, nome: string): Promise<{ id: number; nome: string }> =>
+  requestAdmin(`${FN}/admin/fiado/estabelecimentos/${id}`, { method: 'PATCH', body: JSON.stringify({ nome }) })
+
+// ── Pessoas do fiado ──
+/** Sem estabelecimento: todas as pessoas, de todos os lugares. */
+export const getTabCustomers = (estabelecimentoId?: number): Promise<TabCustomer[]> =>
+  requestAdmin<{ id: number; name: string; nickname: string | null; estabelecimento_id: number; estabelecimento: string; phone: string | null; devendo: string; vendas_abertas: number; ultima_compra: string | null }[]>(
+    `${FN}/admin/tab/customers${query({ estabelecimento: estabelecimentoId })}`,
+  ).then((rows) => rows.map((r) => ({
+    id: r.id,
+    name: r.name,
+    nickname: r.nickname ?? undefined,
+    estabelecimentoId: r.estabelecimento_id,
+    estabelecimento: r.estabelecimento,
+    phone: r.phone ?? undefined,
+    devendo: Number(r.devendo),
+    vendasAbertas: r.vendas_abertas,
+    ultimaCompra: r.ultima_compra ?? undefined,
+  })))
+
+export const createTabCustomer = (name: string, nickname?: string, phone?: string, estabelecimentoId?: number): Promise<{ id: number; name: string }> =>
+  requestAdmin(`${FN}/admin/tab/customers`, { method: 'POST', body: JSON.stringify({ name, nickname, phone, estabelecimentoId }) })
+
+/** Apelido usado so na mensagem de cobranca. Manda vazio para tirar. */
+export const setTabCustomerNickname = (id: number, nickname: string): Promise<{ id: number; name: string }> =>
+  requestAdmin(`${FN}/admin/tab/customers/${id}`, { method: 'PATCH', body: JSON.stringify({ nickname }) })
+
+/** Telefone do WhatsApp. Manda vazio para tirar. */
+export const setTabCustomerPhone = (id: number, phone: string): Promise<{ id: number; name: string }> =>
+  requestAdmin(`${FN}/admin/tab/customers/${id}`, { method: 'PATCH', body: JSON.stringify({ phone }) })
+
+/** Anota no historico que a cobranca foi mandada. */
+export const markCharged = (customerId: number): Promise<{ ok: boolean }> =>
+  requestAdmin(`${FN}/admin/tab/customers/${customerId}/charged`, { method: 'POST' })
+
+export const renameTabCustomer = (id: number, name: string): Promise<{ id: number; name: string }> =>
+  requestAdmin(`${FN}/admin/tab/customers/${id}`, { method: 'PATCH', body: JSON.stringify({ name }) })
+
+export const deleteTabCustomer = (id: number): Promise<{ message: string }> =>
+  requestAdmin(`${FN}/admin/tab/customers/${id}`, { method: 'DELETE' })
+
+export const mergeTabCustomers = (from: number, to: number): Promise<{ message: string }> =>
+  requestAdmin(`${FN}/admin/tab/customers/merge`, { method: 'POST', body: JSON.stringify({ from, to }) })
+
+export const createTabSale = (data: {
+  customerId: number
+  items: { productId: number; quantity: number }[]
+  soldAt?: string
+  notes?: string
+  paid?: boolean
+  /** cookies trocados por pontos: um id de produto por cookie, entram de graca */
+  resgates?: number[]
+}): Promise<TabSale> =>
+  requestAdmin(`${FN}/admin/tab`, { method: 'POST', body: JSON.stringify(data) }).then(toTabSale)
+
+export const setTabSalePaid = (id: number, paid: boolean): Promise<TabSale> =>
+  requestAdmin(`${FN}/admin/tab/${id}/paid`, { method: 'PATCH', body: JSON.stringify({ paid }) })
+    .then(toTabSale)
+
+/**
+ * Corrige so o dia do pagamento (AAAA-MM-DD) de uma venda de fiado ja quitada.
+ * Serve tanto a aba Fiado quanto as linhas do fiado na aba Vendas.
+ */
+export const setTabSalePaymentDate = (id: number, paidOn: string): Promise<TabSale> =>
+  requestAdmin(`${FN}/admin/tab/${id}/payment-date`, {
+    method: 'PATCH', body: JSON.stringify({ paidOn }),
+  })
+    .then(toTabSale)
+    .catch((e: unknown) => {
+      // servidor ainda sem a rota nova: explica em vez de mostrar "Rota nao encontrada"
+      if (e instanceof Error && /rota nao encontrada/i.test(e.message)) {
+        throw new Error('Editar o dia do pagamento ainda não está disponível no servidor.')
+      }
+      throw e
+    })
+
+/** Abate uma parte do valor: a pessoa pagou so um pedaco agora. */
+export const addTabPayment = (id: number, amount: number): Promise<TabSale> =>
+  requestAdmin(`${FN}/admin/tab/${id}/payment`, { method: 'PATCH', body: JSON.stringify({ amount }) })
+    .then(toTabSale)
+
+/** Marca que a venda ja foi lancada na planilha pessoal */
+export const setTabSaleAnnotated = (id: number, annotated: boolean): Promise<TabSale> =>
+  requestAdmin(`${FN}/admin/tab/${id}/annotated`, { method: 'PATCH', body: JSON.stringify({ annotated }) })
+    .then(toTabSale)
+
+/** Marca de uma vez todas as vendas pagas que ainda nao foram anotadas */
+export const annotateAllTabSales = (): Promise<{ anotadas: number }> =>
+  requestAdmin(`${FN}/admin/tab/annotate-all`, { method: 'POST' })
+
+// ── Fidelidade no painel: pontos, troca por cookie e senha da cliente ──
+export const getSaldosFidelidade = (): Promise<SaldosFidelidade> =>
+  requestAdmin<{
+    clientes: {
+      customer_id: number; nome: string; pontos: number; a_receber: number; vence_em: string | null
+      tem_acesso: boolean; ultimo_acesso: string | null; convite_ate: string | null
+    }[]
+    cookies: { product_id: number; pontos: number }[]
+  }>(`${FN}/admin/fidelidade`).then((r) => ({
+    clientes: new Map(r.clientes.map((c) => [c.customer_id, {
+      customerId: c.customer_id, nome: c.nome, pontos: c.pontos, aReceber: c.a_receber ?? 0, venceEm: c.vence_em ?? undefined,
+      temAcesso: c.tem_acesso, ultimoAcesso: c.ultimo_acesso ?? undefined,
+      conviteAte: c.convite_ate ?? undefined,
+    }])),
+    cookies: new Map(r.cookies.map((c) => [c.product_id, c.pontos])),
+  }))
+
+/** Convite para a cliente criar a senha (primeiro acesso ou senha esquecida). O codigo so vem aqui. */
+export const gerarConviteCliente = (customerId: number): Promise<ConviteCliente> =>
+  requestAdmin<{ customer_id: number; nome: string; telefone: string; codigo: string; expira_em: string }>(
+    `${FN}/admin/tab/customers/${customerId}/convite`, { method: 'POST' },
+  ).then((r) => ({ customerId: r.customer_id, nome: r.nome, telefone: r.telefone, codigo: r.codigo, expiraEm: r.expira_em }))
+
+// ── Historico (auditoria) ─────────────────────────────
+export const getHistory = (opts: { entity?: string; actor?: string; limit?: number } = {}): Promise<AuditEntry[]> => {
+  const p = new URLSearchParams()
+  if (opts.entity) p.set('entity', opts.entity)
+  if (opts.actor) p.set('actor', opts.actor)
+  p.set('limit', String(opts.limit ?? 150))
+  return requestAdmin<{ id: number; actor: string; action: string; description: string; entity: string | null; entity_id: number | null; created_at: string }[]>(
+    `${FN}/admin/history?${p}`,
+  ).then((rows) => rows.map((r) => ({
+    id: r.id,
+    actor: r.actor,
+    action: r.action,
+    description: r.description,
+    entity: r.entity ?? undefined,
+    entityId: r.entity_id ?? undefined,
+    createdAt: r.created_at,
+  })))
+}
+
+export const getHistoryActors = (): Promise<string[]> =>
+  requestAdmin<string[]>(`${FN}/admin/history/actors`)
+
+export const deleteTabSale = (id: number): Promise<{ message: string }> =>
+  requestAdmin(`${FN}/admin/tab/${id}`, { method: 'DELETE' })
+
+export const payAllForCustomer = (customerId: number): Promise<{ quitadas: number }> =>
+  requestAdmin(`${FN}/admin/tab/pay-all`, { method: 'POST', body: JSON.stringify({ customerId }) })
+
+/* =====================================================================
+   Sistema da planilha (Edge Function /planilha).
+   Usa o mesmo token do painel; e uma funcao separada de proposito.
+   ===================================================================== */
+const PLAN = `${FN}/planilha`
+
+const post = <T>(url: string, body: unknown) =>
+  requestAdmin<T>(url, { method: 'POST', body: JSON.stringify(body) })
+const patch = <T>(url: string, body?: unknown) =>
+  requestAdmin<T>(url, { method: 'PATCH', ...(body ? { body: JSON.stringify(body) } : {}) })
+const del = <T>(url: string) => requestAdmin<T>(url, { method: 'DELETE' })
+
+/** Apaga o pedido de vez. O estoque so volta se o pedido ainda estava valendo. */
+export const excluirPedido = (id: number) =>
+  requestAdmin<{ customer_name: string; itens: string; estoque_devolvido: boolean }>(
+    `${FN}/admin/orders/${id}`, { method: 'DELETE' })
+
+/** Troca os cookies e a observacao de um pedido. O estoque se ajusta sozinho. */
+export const editarPedido = (
+  id: number,
+  items: { productId: number; quantity: number }[],
+  notes?: string,
+) => requestAdmin<OrderResponse>(`${FN}/admin/orders/${id}/itens`, {
+  method: 'PATCH',
+  body: JSON.stringify({ items, notes: notes ?? null }),
+})
+
+export const getResumoFinanceiro = () => requestAdmin<ResumoFinanceiro>(`${PLAN}/resumo`)
+
+/* ---------- Custos ---------- */
+export const getCustos = () => requestAdmin<Custos>(`${PLAN}/custos`)
+
+export const salvarIngrediente = (b: {
+  id?: number; name: string; unit: string; notes?: string | null
+}) => post(`${PLAN}/custos/ingrediente`, b)
+
+export const excluirIngrediente = (id: number) => del(`${PLAN}/custos/ingrediente/${id}`)
+
+export const salvarPreco = (b: {
+  id?: number; ingredientId?: number; packageQty: number
+  packagePrice: number; market?: string | null; isReference?: boolean
+}) => post(`${PLAN}/custos/preco`, b)
+
+/** Passa a calcular o custo dos sabores por este preco. */
+export const usarPrecoDeReferencia = (id: number) => patch(`${PLAN}/custos/preco/${id}/referencia`)
+export const excluirPreco = (id: number) => del(`${PLAN}/custos/preco/${id}`)
+
+export const definirRendimento = (rendimento: number) =>
+  patch(`${PLAN}/custos/receita`, { yield: rendimento })
+
+export const salvarItemReceita = (b: {
+  id?: number; ingredientId?: number; label?: string | null
+  quantity: number; note?: string | null
+}) => post(`${PLAN}/custos/receita/item`, b)
+
+export const excluirItemReceita = (id: number) => del(`${PLAN}/custos/receita/item/${id}`)
+
+export const salvarEmbalagem = (b: {
+  id?: number; name: string; unitCost: number; note?: string | null; active?: boolean
+}) => post(`${PLAN}/custos/embalagem`, b)
+
+export const excluirEmbalagem = (id: number) => del(`${PLAN}/custos/embalagem/${id}`)
+
+export const salvarItemSabor = (b: {
+  id?: number; productId?: number; component?: string
+  ingredientId?: number; quantity: number; note?: string | null
+}) => post(`${PLAN}/custos/sabor/item`, b)
+
+export const excluirItemSabor = (id: number) => del(`${PLAN}/custos/sabor/item/${id}`)
+
+/* ---------- Compras ---------- */
+export const getCompras = (categoria?: CategoriaCompra) =>
+  requestAdmin<ListaCompras>(`${PLAN}/compras${categoria ? `?category=${categoria}` : ''}`)
+
+export const salvarCompra = (b: Partial<Compra> & { amount: number; items: ItemCompra[] }) =>
+  post<Compra>(`${PLAN}/compras`, b)
+
+export const excluirCompra = (id: number) => del(`${PLAN}/compras/${id}`)
+
+/** cria a categoria; se o nome ja existe, devolve a existente */
+export const criarCategoriaCompra = (b: { label: string; cor: CorCategoria }) =>
+  post<CategoriaCompraInfo>(`${PLAN}/compras/categorias`, b)
+
+/* ---------- Vendas gerais ---------- */
+export const getVendas = (origem?: OrigemVenda) =>
+  requestAdmin<ListaVendas>(`${PLAN}/vendas${origem ? `?origin=${origem}` : ''}`)
+
+export const salvarVenda = (b: {
+  id?: number; soldAt?: string | null; customerName: string; amount: number
+  deliveryFee?: number; deliveryCost?: number; kind?: TipoVenda
+  deliveryMode?: ModoEntrega; paymentMethod?: FormaPagamento | null; notes?: string | null
+  /** so no cartao_outro: a taxa ja calculada (total - liquido que caiu) */
+  paymentFee?: number | null
+  /** omita para nao mexer nos itens; [] limpa */
+  items?: { productId: number; quantity: number; unitPrice?: number }[]
+  /** cliente do cadastro; com customerName vazio, o nome vem dele */
+  customerId?: number | null
+}) => post<VendaGeral>(`${PLAN}/vendas`, b)
+
+/* ---------- Clientes (cadastro unico) ---------- */
+export const getClientesPainel = () => requestAdmin<PainelClientes>(`${PLAN}/clientes`)
+
+/** cria (sem id) ou edita; estabelecimentoId null = cliente direto */
+export const salvarCliente = (b: { id?: number; name: string; phone?: string | null; estabelecimentoId?: number | null }) =>
+  post<ClienteCadastro & { estabelecimento_id: number | null }>(`${PLAN}/clientes`, b)
+
+export const excluirCliente = (id: number) => del(`${PLAN}/clientes/${id}`)
+
+/** liga vendas gerais ao cliente (customerId null desliga). So muda o vinculo. */
+export const ligarVendasCliente = (ids: number[], customerId: number | null) =>
+  post<{ ligadas: number }>(`${PLAN}/clientes/ligar`, { ids, customerId })
+
+export const excluirVenda = (id: number) => del(`${PLAN}/vendas/${id}`)
+
+/* ---------- Formas de pagamento e a taxa da maquininha ---------- */
+export const getFormasPagamento = () => requestAdmin<MetodoPagamento[]>(`${PLAN}/pagamentos`)
+
+/** So vale para vendas novas: as antigas guardam a taxa que valia na epoca. */
+export const definirTaxaPagamento = (code: FormaPagamento, feePercent: number, feeFixed?: number) =>
+  patch<MetodoPagamento>(`${PLAN}/pagamentos/taxa`, { code, feePercent, feeFixed })
+
+/* ---------- A anotar na planilha (as duas origens) ---------- */
+export const getAAnotar = () => requestAdmin<ListaAAnotar>(`${PLAN}/a-anotar`)
+
+export const anotarTodasAsVendas = () =>
+  post<{ anotadas: number }>(`${PLAN}/a-anotar/todas`, {})
+
+export const marcarAnotada = (origem: OrigemVenda, id: number, annotated: boolean) =>
+  patch(`${PLAN}/a-anotar/${origem}/${id}`, { annotated })
+
+/* ---------- Etiquetas de sabor (o PDF e montado no navegador, ver etiquetas.ts) ---------- */
+export type Etiqueta = { id: number; nome: string }
+export const getEtiquetas = () => requestAdmin<Etiqueta[]>(`${FN}/admin/etiquetas`)
+export const criarEtiqueta = (nome: string) =>
+  requestAdmin<Etiqueta>(`${FN}/admin/etiquetas`, { method: 'POST', body: JSON.stringify({ nome }) })
+export const excluirEtiqueta = (id: number) =>
+  requestAdmin<Etiqueta>(`${FN}/admin/etiquetas/${id}`, { method: 'DELETE' })

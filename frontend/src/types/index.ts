@@ -1,0 +1,548 @@
+export interface Category {
+  id: number
+  name: string
+  description: string
+  displayOrder: number
+}
+
+export interface Product {
+  id: number
+  name: string
+  description: string
+  price: number
+  imageUrl?: string
+  weight?: string
+  available: boolean
+  stock: number
+  category: Category
+}
+
+export type PaymentMethod = 'PIX' | 'CARD' | 'CASH'
+export type OrderStatus = 'PENDING' | 'PREPARING' | 'READY' | 'DELIVERED' | 'CANCELLED'
+
+export interface CartItem {
+  product: Product
+  quantity: number
+}
+
+export interface OrderItemResponse {
+  productId: number
+  productName: string
+  quantity: number
+  unitPrice: number
+  subtotal: number
+}
+
+export interface OrderResponse {
+  id: number
+  customerName: string
+  customerPhone: string
+  customerEmail?: string
+  paymentMethod: PaymentMethod
+  paymentStatus: string
+  status: OrderStatus
+  totalAmount: number
+  changeAmount?: number
+  notes?: string
+  address?: string
+  deliveryMethod?: 'PICKUP' | 'DELIVERY'
+  deliveryFee?: number
+  /** 'site' = veio do site · 'manual' = anotado no painel */
+  source?: 'site' | 'manual'
+  createdAt: string
+  items: OrderItemResponse[]
+}
+
+/** Registro do historico: quem fez o que e quando */
+export interface AuditEntry {
+  id: number
+  actor: string
+  action: string
+  description: string
+  entity?: string
+  entityId?: number
+  createdAt: string
+}
+
+/** Um item do lote levado para vender */
+export interface ProducaoItem {
+  productId: number
+  productName: string
+  levado: number
+  vendido: number
+  /** saiu sem virar venda: dei, comeram, descarte */
+  semVenda: number
+  restante: number
+}
+
+/** Lote aberto: o que foi produzido e quanto ja saiu */
+export interface Producao {
+  id: number
+  label?: string
+  startedAt: string
+  itens: ProducaoItem[]
+  levado: number
+  vendido: number
+  semVenda: number
+  restante: number
+}
+
+/** Quantos cookies de cada sabor precisam ser feitos */
+export interface ProductionSummary {
+  porSabor: { productId: number; productName: string; quantidade: number }[]
+  totalCookies: number
+  totalPedidos: number
+}
+
+/** Caderneta: venda presencial com pagamento posterior */
+export interface TabSaleItem {
+  productId: number
+  productName: string
+  quantity: number
+  unitPrice: number
+  subtotal: number
+}
+
+export interface TabSale {
+  id: number
+  customerId: number
+  customerName: string
+  /** estabelecimento de fiado da pessoa (o nome vem do banco) */
+  estabelecimentoId: number
+  estabelecimento?: string
+  soldAt: string
+  total: number
+  paid: boolean
+  paidAt?: string
+  /** quanto ja foi recebido; igual ao total quando a venda esta quitada */
+  paidAmount: number
+  /** ja lancado na planilha pessoal */
+  annotated: boolean
+  annotatedAt?: string
+  notes?: string
+  /** fechamento em que a venda entrou; sem ele, fica para o proximo */
+  fechamentoId?: number
+  items: TabSaleItem[]
+}
+
+/** Fechamento do fiado de um estabelecimento (docs/fiado.md) */
+export interface FechamentoFiado {
+  id: number
+  fechadoEm: string
+  vendas: number
+  total: number
+}
+
+export interface TabSummaryRow {
+  customerId: number
+  customerName: string
+  nickname?: string
+  estabelecimentoId: number
+  /** so digitos, no formato 55 + DDD + numero */
+  phone?: string
+  /** cobranca pronta, montada no servidor (so do que entra na cobranca; vazia se nada) */
+  message: string
+  devendo: number
+  vendasAbertas: number
+  /** o que entra na cobranca: vendas do fechamento (ou tudo, se o lugar nunca fechou) */
+  devendoFechado: number
+  vendasFechadas: number
+  totalGeral: number
+  ultimaCompra: string
+}
+
+/**
+ * Estabelecimento de venda fiado. Os nomes vivem so no banco: o codigo so
+ * conhece o id. O principal nao leva sufixo no nome que vai para a planilha.
+ */
+export interface Estabelecimento {
+  id: number
+  nome: string
+  principal: boolean
+  clientes: number
+  aReceber: number
+}
+
+/** Pessoa cadastrada no fiado de um estabelecimento */
+export interface TabCustomer {
+  id: number
+  name: string
+  /** apelido, usado so na mensagem de cobranca */
+  nickname?: string
+  estabelecimentoId: number
+  estabelecimento: string
+  phone?: string
+  devendo: number
+  vendasAbertas: number
+  ultimaCompra?: string
+}
+
+/* ---------- Fidelidade: pontos das clientes do fiado (docs/fidelidade.md) ---------- */
+export interface CookiePontos {
+  productId: number
+  nome: string
+  imagem?: string
+  /** pontos para trocar por um cookie desse sabor */
+  pontos: number
+}
+
+export interface MovimentoPontos {
+  data: string
+  tipo: 'ganho' | 'resgate' | 'vencido' | 'ajuste'
+  pontos: number
+  descricao: string
+}
+
+/** Tudo o que a pagina da cliente mostra */
+export interface PainelFidelidade {
+  nome: string
+  pontos: number
+  pontosPorReal: number
+  validadeDias: number
+  /** dia em que os pontos vencem se ela nao comprar ate la */
+  venceEm?: string
+  /** pontos que entram quando o fiado em aberto for pago */
+  aLiberar: number
+  /** fiado em aberto (com ou sem pontos) */
+  devendo: number
+  emAberto: CompraEmAberto[]
+  /** para pagar o fiado; so vem quando ela deve */
+  pix?: { chave: string; nome: string }
+  cookies: CookiePontos[]
+  extrato: MovimentoPontos[]
+}
+
+export interface CompraEmAberto {
+  id: number
+  data: string
+  itens: string
+  total: number
+  /** quanto ja pagou dessa compra */
+  pago: number
+  /** pontos que ela recebe quando essa compra for paga */
+  pontos: number
+  /** feita a partir do lancamento do programa (as de antes nao dao pontos) */
+  conta: boolean
+}
+
+export interface PontosCliente {
+  customerId: number
+  nome: string
+  pontos: number
+  /** pontos das compras em aberto, que entram quando ela pagar */
+  aReceber: number
+  /** dia em que os pontos vencem se ela nao comprar ate la */
+  venceEm?: string
+  /** ja criou a senha dela */
+  temAcesso: boolean
+  ultimoAcesso?: string
+  /** convite enviado e ainda nao usado: vale ate esse instante */
+  conviteAte?: string
+}
+
+export interface SaldosFidelidade {
+  /** por id da cliente; so as do estabelecimento principal participam */
+  clientes: Map<number, PontosCliente>
+  /** pontos de cada cookie, por id do produto */
+  cookies: Map<number, number>
+}
+
+/** Convite para a cliente criar a senha. O codigo so aparece ao ser gerado. */
+export interface ConviteCliente {
+  customerId: number
+  nome: string
+  telefone: string
+  codigo: string
+  expiraEm: string
+}
+
+export interface PixPaymentCreatedResponse {
+  orderId: number
+  paymentId: number
+  qrCodeBase64: string
+  copyPasteCode: string
+  totalAmount: number
+  expiresAt: string
+}
+
+/* =====================================================================
+   Sistema que veio da planilha: custos, compras e vendas gerais.
+   Nao se mistura com o fiado nem com os clientes dele.
+   ===================================================================== */
+
+export type UnidadeIngrediente = 'g' | 'ml' | 'un'
+
+/** Um preco do mesmo ingrediente num mercado. Um deles e a referencia do custo. */
+export interface PrecoIngrediente {
+  id: number
+  packageQty: number
+  packagePrice: number
+  market?: string
+  isReference: boolean
+  unitCost: number
+}
+
+export interface Ingrediente {
+  id: number
+  name: string
+  unit: UnidadeIngrediente
+  notes?: string
+  /** custo por g/ml/un vindo do preco de referencia; null se nao tem preco */
+  unitCost: number | null
+  precos: PrecoIngrediente[]
+}
+
+export interface ItemReceita {
+  id: number
+  ingredientId: number
+  label: string
+  ingredientName: string
+  quantity: number
+  unit: UnidadeIngrediente
+  note?: string
+  unitCost: number
+  totalCost: number
+  costPerCookie: number
+}
+
+export interface Receita {
+  id: number
+  name: string
+  /** quantos cookies saem de uma receita */
+  yield: number
+  totalCost: number
+  costPerCookie: number
+  itens: ItemReceita[]
+}
+
+export interface Embalagem {
+  id: number
+  name: string
+  unitCost: number
+  note?: string
+  active: boolean
+}
+
+export type ComponenteSabor = 'chocolate' | 'recheio' | 'topo' | 'extra'
+
+export interface ItemSabor {
+  id: number
+  component: ComponenteSabor
+  ingredientId: number
+  ingredientName: string
+  quantity: number
+  unit: UnidadeIngrediente
+  note?: string
+  unitCost: number
+  totalCost: number
+}
+
+export interface CustoSabor {
+  productId: number
+  name: string
+  salePrice: number
+  ingredientsCost: number
+  doughCost: number
+  packagingCost: number
+  totalCost: number
+  margin: number
+  itens: ItemSabor[]
+}
+
+export interface Custos {
+  ingredientes: Ingrediente[]
+  receita: Receita | null
+  embalagem: Embalagem[]
+  embalagemTotal: number
+  sabores: CustoSabor[]
+}
+
+/** slug da categoria; as 6 de fabrica + as que o dono cria (tabela purchase_categories) */
+export type CategoriaCompra = string
+
+export type CorCategoria = 'marrom' | 'azul' | 'roxo' | 'amarelo' | 'verde' | 'vermelho' | 'cinza'
+
+export interface CategoriaCompraInfo {
+  slug: CategoriaCompra
+  label: string
+  cor: CorCategoria
+}
+
+/** um item de uma compra com varios itens (sem preco: o valor e o da compra) */
+export interface ItemCompra {
+  item: string
+  quantity?: string | null
+  unit?: string | null
+}
+
+export interface Compra {
+  id: number
+  boughtAt?: string
+  item: string
+  quantity?: string
+  unit?: string
+  amount: number
+  market?: string
+  category: CategoriaCompra
+  notes?: string
+  /** so nas compras com 2 ou mais itens; item vira o resumo deles */
+  produtos?: ItemCompra[] | null
+}
+
+export interface ListaCompras {
+  itens: Compra[]
+  quantas: number
+  /** so as linhas de compra */
+  total: number
+  /** combustivel das entregas; mora nas vendas e aparece aqui somado */
+  combustivel: number
+  entregasComGasto: number
+  /** total + combustivel: o que realmente saiu do bolso */
+  totalGeral: number
+  /** mercados ja usados, para sugerir no formulario */
+  mercados: string[]
+  porCategoria: { category: CategoriaCompra; linhas: number; total: number }[]
+  /** todas as categorias, inclusive as sem compra ainda, na ordem de exibir */
+  categorias: CategoriaCompraInfo[]
+}
+
+export type TipoVenda = 'venda' | 'consumo_proprio' | 'brinde'
+export type ModoEntrega = 'entrega' | 'retirada'
+/** cartao_outro: cartao em que voce digita o liquido que caiu; a taxa e a diferenca */
+export type FormaPagamento = 'dinheiro' | 'pix' | 'debito' | 'credito' | 'cartao_outro'
+
+/** Forma de pagamento e a taxa que a maquininha cobra. */
+export interface MetodoPagamento {
+  code: FormaPagamento
+  label: string
+  /** percentual da maquininha, ex: 4.99 */
+  feePercent: number
+  /** taxa fixa por venda, se houver */
+  feeFixed: number
+  active: boolean
+}
+
+/** geral = lancada em Vendas; fiado = venda de fiado ja quitada */
+export type OrigemVenda = 'geral' | 'fiado'
+
+/** Um sabor dentro de uma venda geral. */
+export interface ItemVenda {
+  productId: number | null
+  productName: string
+  quantity: number
+  unitPrice: number
+}
+
+export interface VendaGeral {
+  /** de onde veio: lancada aqui ou uma venda de fiado ja quitada */
+  origin: OrigemVenda
+  id: number
+  /** nas de fiado, o estabelecimento (nome vindo do banco) */
+  estabelecimento?: string
+  /** quando o dinheiro entrou; nas de fiado e a data do pagamento */
+  soldAt?: string
+  /** quando o cookie foi vendido de fato */
+  saleDate?: string
+  customerName: string
+  amount: number
+  /** taxa cobrada do cliente */
+  deliveryFee: number
+  /** combustivel que voce gastou para entregar */
+  deliveryCost: number
+  /** retirada nao tem taxa nem gasto */
+  deliveryMode: ModoEntrega
+  paymentMethod?: FormaPagamento | null
+  /** quanto a maquininha ficou; congelado na hora da venda */
+  paymentFee: number
+  kind: TipoVenda
+  notes?: string
+  /** os cookies da venda; vazio nas 180 que vieram da planilha, que so tinham o total */
+  produtos: ItemVenda[]
+  /** cliente do cadastro; nas vendas antigas ainda nao ligadas, null */
+  customerId?: number | null
+  /** nome atual do cliente no cadastro (o customerName e o que foi gravado na venda) */
+  clienteNome?: string | null
+}
+
+/** cliente do cadastro unico: direto (sem estabelecimento) ou do fiado */
+export interface ClienteCadastro {
+  id: number
+  name: string
+  phone?: string | null
+  estabelecimentoId: number | null
+  estabelecimento: string | null
+  /** vendas gerais ligadas a ele */
+  vendas: number
+  total: number
+  ultima?: string | null
+}
+
+export interface VendaSemCliente {
+  id: number
+  soldAt?: string | null
+  amount: number
+  customerName: string
+  kind: TipoVenda
+}
+
+/** vendas antigas com o mesmo nome (sem diferenciar maiuscula e espaco) */
+export interface GrupoSemCliente {
+  chave: string
+  nome: string
+  quantas: number
+  total: number
+  vendas: VendaSemCliente[]
+}
+
+export interface PainelClientes {
+  clientes: ClienteCadastro[]
+  estabelecimentos: { id: number; nome: string; principal: boolean }[]
+  semCliente: GrupoSemCliente[]
+}
+
+export interface ListaVendas {
+  itens: VendaGeral[]
+  quantas: number
+  cookies: number
+  taxas: number
+  combustivel: number
+  consumo: number
+  retiradas: number
+  maquininha: number
+  porOrigem: { origin: string; vendas: number; total: number }[]
+}
+
+/** Uma linha esperando para ir para a sua planilha. */
+export interface VendaAAnotar {
+  origin: OrigemVenda
+  id: number
+  estabelecimento?: string
+  soldAt?: string
+  saleDate?: string
+  customerName: string
+  cookies: number
+  taxa: number
+  /** taxa da maquininha (cartao); some enquanto o banco nao manda */
+  taxaCartao?: number
+  /** cookies + taxa - taxa do cartao: e assim que a venda entra na planilha */
+  valor: number
+}
+
+export interface ListaAAnotar {
+  itens: VendaAAnotar[]
+  quantas: number
+  total: number
+}
+
+export interface ResumoFinanceiro {
+  receita: number
+  cookies: number
+  taxas: number
+  combustivel: number
+  /** taxa da maquininha; dinheiro que voce nao recebeu */
+  maquininha: number
+  compras: number
+  saldo: number
+  /** ainda em aberto no fiado */
+  aReceber: number
+}

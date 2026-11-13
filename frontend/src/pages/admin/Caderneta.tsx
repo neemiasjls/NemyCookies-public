@@ -1,0 +1,744 @@
+import { hoje, dataBR, diaEmBrasilia } from '../../data'
+import { useEffect, useMemo, useState } from 'react'
+import {
+  getTabSales, getTabSummary, getTabCustomers, createTabSale, createTabCustomer,
+  setTabSalePaid, setTabSalePaymentDate, deleteTabSale, addTabPayment,
+  getSaldosFidelidade, getFechamentoFiado, fecharFiado,
+  payAllForCustomer, setTabSaleAnnotated, markCharged, TabStatus,
+} from '../../api/api'
+import { Product, TabSale, TabSummaryRow, TabCustomer, SaldosFidelidade, FechamentoFiado } from '../../types'
+import { useEstabelecimento } from '../../hooks/useEstabelecimento'
+import SeletorEstabelecimento from '../../components/SeletorEstabelecimento'
+import SeletorCliente from '../../components/SeletorCliente'
+import Producao from './Producao'
+import WhatsAppIcon from '../../components/WhatsAppIcon'
+import { AvisoEstoque, EstoqueDoSabor } from '../../components/AvisoEstoque'
+import {
+  Plus, Minus, Check, Trash2, Undo2, Loader2, CalendarDays,
+  NotebookPen, HandCoins, X, MessageCircle, ChevronRight, Gift, Lock,
+} from 'lucide-react'
+
+const brl = (v: number) => `R$ ${v.toFixed(2).replace('.', ',')}`
+
+/**
+ * Fiado de um estabelecimento por vez: cada um tem os proprios clientes,
+ * o proprio "A receber" e a propria lista de vendas.
+ */
+export default function Caderneta({ products, onEstoqueMudou }: {
+  products: Product[]
+  /** a venda do fiado mexe no estoque: o painel recarrega os sabores */
+  onEstoqueMudou?: () => void
+}) {
+  const estab = useEstabelecimento()
+  const [sales, setSales] = useState<TabSale[]>([])
+  const [summary, setSummary] = useState<TabSummaryRow[]>([])
+  const [customers, setCustomers] = useState<TabCustomer[]>([])
+  const [filtro, setFiltro] = useState<TabStatus>('open')
+  const [loading, setLoading] = useState(true)
+  const [salvando, setSalvando] = useState(false)
+  const [editandoPagamento, setEditandoPagamento] = useState<number | null>(null)
+  const [dataPagamento, setDataPagamento] = useState('')
+  const [salvandoPagamento, setSalvandoPagamento] = useState(false)
+  // sobe a cada recarga para o painel de producao acompanhar as vendas novas
+  const [versao, setVersao] = useState(0)
+  // qual cliente do "A receber" esta com a lista de vendas aberta
+  const [abertoId, setAbertoId] = useState<number | null>(null)
+  // vendas em aberto, guardadas a parte: o filtro da tela pode estar em outra aba
+  const [abertas, setAbertas] = useState<TabSale[] | null>(null)
+  const [buscandoVendas, setBuscandoVendas] = useState(false)
+  // pontos de fidelidade das clientes do principal (docs/fidelidade.md)
+  const [fidelidade, setFidelidade] = useState<SaldosFidelidade | null>(null)
+  // ultimo fechamento do estabelecimento: so o fechado entra na cobranca (docs/fiado.md)
+  const [fechamento, setFechamento] = useState<FechamentoFiado | null>(null)
+  const [fechando, setFechando] = useState(false)
+  // o que resta no "Levei para vender": a venda do fiado sai dele antes do estoque
+  const [noLote, setNoLote] = useState<Record<number, number>>({})
+
+  // formulario de venda
+  const [pessoaId, setPessoaId] = useState<number | null>(null)
+  const [data, setData] = useState(hoje())
+  const [jaPago, setJaPago] = useState(false)
+  const [qtds, setQtds] = useState<Record<number, number>>({})
+
+  const carregar = async (status: TabStatus = filtro) => {
+    const est = estab.id
+    if (!est) return
+    setLoading(true)
+    try {
+      const [lista, resumo, pessoas, fech] = await Promise.all([
+        getTabSales(status, est), getTabSummary(est), getTabCustomers(est),
+        getFechamentoFiado(est).catch(() => null),
+      ])
+      estab.recarregar().catch(() => {})   // o "a receber" de cada chip
+      getSaldosFidelidade().then(setFidelidade).catch(() => setFidelidade(null))
+      setSales(lista); setSummary(resumo); setCustomers(pessoas); setFechamento(fech)
+      // as vendas em aberto alimentam os dropdowns do "A receber".
+      // Se voce esta numa aba de pagos com um dropdown aberto, busca elas a parte,
+      // senao o cartao sumiria da tela logo depois de voce mexer nele.
+      if (status === 'open') setAbertas(lista)
+      else if (abertoId !== null) setAbertas(await getTabSales('open', est))
+      else setAbertas(null)
+      setVersao((n) => n + 1)
+    } finally { setLoading(false) }
+  }
+
+  // trocar de estabelecimento fecha o que estava aberto e comeca do zero
+  useEffect(() => {
+    setAbertoId(null); setAbertoProx(null); setAbertas(null); setPessoaId(null); setClienteAberto(null)
+    carregar(filtro)
+  }, [filtro, estab.id])
+
+  const totalCarrinho = useMemo(
+    () => Object.entries(qtds).reduce((soma, [id, q]) => {
+      const p = products.find((x) => x.id === Number(id))
+      return soma + (p ? p.price * q : 0)
+    }, 0),
+    [qtds, products],
+  )
+
+  const mudarQtd = (id: number, delta: number) =>
+    setQtds((prev) => {
+      const nova = Math.max(0, (prev[id] ?? 0) + delta)
+      const copia = { ...prev }
+      if (nova === 0) delete copia[id]; else copia[id] = nova
+      return copia
+    })
+
+  const salvarDataPagamento = async (v: TabSale) => {
+    if (salvandoPagamento) return
+    if (!dataPagamento || dataPagamento > hoje()) return alert('Informe uma data de pagamento válida, até hoje.')
+    if (dataPagamento < v.soldAt) return alert(`O pagamento não pode ser antes da venda (${dataBR(v.soldAt)}).`)
+    if (dataPagamento === diaEmBrasilia(v.paidAt)) { setEditandoPagamento(null); return }
+    setSalvandoPagamento(true)
+    try {
+      await setTabSalePaymentDate(v.id, dataPagamento)
+      setEditandoPagamento(null)
+      await carregar()
+    } catch (e) {
+      alert(e instanceof Error ? e.message : 'Erro ao salvar a data do pagamento')
+    } finally { setSalvandoPagamento(false) }
+  }
+
+  const registrar = async () => {
+    const items = Object.entries(qtds).map(([id, q]) => ({ productId: Number(id), quantity: q }))
+    if (!pessoaId) return alert('Selecione a pessoa')
+    if (!items.length && !resgates.length) return alert('Selecione ao menos um cookie')
+    setSalvando(true)
+    try {
+      await createTabSale({ customerId: pessoaId, items, soldAt: data, paid: jaPago, resgates })
+      setPessoaId(null); setQtds({}); setJaPago(false); setData(hoje()); setResgates([])
+      await carregar(); onEstoqueMudou?.()
+    } catch (e) {
+      alert(e instanceof Error ? e.message : 'Erro ao registrar')
+    } finally { setSalvando(false) }
+  }
+
+  // Pagamento parcial: a pessoa pagou so um pedaco de uma venda.
+  // Fica escondido atras do icone de moedas, no card da venda.
+  const [parcialId, setParcialId] = useState<number | null>(null)
+  const [valorParcial, setValorParcial] = useState('')
+  const [salvandoParcial, setSalvandoParcial] = useState(false)
+
+  const fecharParcial = () => { setParcialId(null); setValorParcial('') }
+
+  const registrarParcial = async (v: TabSale) => {
+    const falta = v.total - v.paidAmount
+    const valor = Number(valorParcial.replace(',', '.'))
+    if (!Number.isFinite(valor) || valor <= 0) return alert('Informe um valor maior que zero')
+    if (valor > falta + 0.001) return alert(`Falta so ${brl(falta)} nessa venda.`)
+    setSalvandoParcial(true)
+    try {
+      await addTabPayment(v.id, Number(valor.toFixed(2)))
+      fecharParcial()
+      await carregar()
+    } catch (e) {
+      alert(e instanceof Error ? e.message : 'Erro ao registrar o pagamento')
+    } finally { setSalvandoParcial(false) }
+  }
+
+  // Troca por pontos: escolhida ao registrar a venda. So aparecem os cookies que o
+  // saldo dela ja paga; cada um entra na venda de graca (docs/fidelidade.md).
+  const pontosDe = (customerId: number) => fidelidade?.clientes.get(customerId)?.pontos ?? 0
+  const custoDe = (productId: number) => fidelidade?.cookies.get(productId) ?? 0
+  const [resgates, setResgates] = useState<number[]>([])
+  const pontosLivres = pessoaId ? pontosDe(pessoaId) - resgates.reduce((t, id) => t + custoDe(id), 0) : 0
+  const cookiesQueDa = products.filter((p) => custoDe(p.id) > 0 && custoDe(p.id) <= pontosLivres)
+    .sort((a, b) => custoDe(a.id) - custoDe(b.id))
+  const custoMinimo = Math.min(...products.map((p) => custoDe(p.id)).filter((c) => c > 0), Infinity)
+  // o cookie gratis tambem sai do estoque: entra no aviso de falta
+  const qtdsComTrocas = useMemo(() => resgates.reduce((q, id) => ({ ...q, [id]: (q[id] ?? 0) + 1 }), { ...qtds }), [qtds, resgates])
+  // trocar de pessoa desfaz a troca escolhida
+  useEffect(() => { setResgates([]) }, [pessoaId])
+
+  // Cobranca: o texto ja vem pronto do servidor junto do resumo
+  // (a chave Pix nunca fica no codigo do site).
+  const [copiadoId, setCopiadoId] = useState<number | null>(null)
+
+  const linkWhatsApp = (r: TabSummaryRow) =>
+    `https://wa.me/${r.phone}?text=${encodeURIComponent(r.message)}`
+
+  /** Usado quando a pessoa ainda nao tem WhatsApp cadastrado. */
+  const copiarCobranca = async (r: TabSummaryRow) => {
+    try {
+      await navigator.clipboard.writeText(r.message)
+      setCopiadoId(r.customerId)
+      setTimeout(() => setCopiadoId(null), 2500)
+    } catch {
+      alert('Copie a mensagem:\n\n' + r.message)
+    }
+  }
+
+  // a mesma pessoa pode estar no fechamento e no proximo: cada lista abre por conta
+  const [abertoProx, setAbertoProx] = useState<number | null>(null)
+
+  /** Abre/fecha a lista de vendas da pessoa no "A receber" (ou no proximo fechamento). */
+  const alternarVendas = async (customerId: number, proximo = false) => {
+    const [atual, abrir] = proximo ? [abertoProx, setAbertoProx] : [abertoId, setAbertoId]
+    if (atual === customerId) { abrir(null); return }
+    abrir(customerId)
+    if (abertas) return
+    setBuscandoVendas(true)
+    try { setAbertas(await getTabSales('open', estab.id ?? undefined)) }
+    catch { setAbertas([]) }
+    finally { setBuscandoVendas(false) }
+  }
+
+  // Com fechamento, o "A receber" se divide: o fechado (cobrar agora) e o que veio
+  // depois (fica para o proximo). Lugar que nunca fechou: tudo entra na cobranca.
+  const usaFechamento = !!fechamento
+  const cobravel = (v: TabSale) => !usaFechamento || v.fechamentoId != null
+  const vendasDe = (customerId: number, proximo = false) =>
+    (abertas ?? []).filter((v) => v.customerId === customerId && !v.paid && cobravel(v) !== proximo)
+
+  // Copiar para a planilha e marcar como anotada vivem na aba Vendas,
+  // onde a lista cobre todas as vendas e nao so as do fiado.
+
+  /**
+   * A lista de baixo tambem agrupa por pessoa, igual ao "A receber": sem isso
+   * a mesma cliente aparecia quatro vezes seguidas e ficava dificil achar
+   * alguem. Cada grupo mostra o que ela ainda deve e quantas faltam anotar,
+   * e abre nos cartoes de sempre.
+   */
+  const porCliente = useMemo(() => {
+    const mapa = new Map<string, {
+      nome: string; itens: TabSale[]; total: number
+      aReceber: number; faltaAnotar: number; ultima: string
+    }>()
+    for (const v of sales) {
+      const g = mapa.get(v.customerName) ?? {
+        nome: v.customerName, itens: [], total: 0,
+        aReceber: 0, faltaAnotar: 0, ultima: '',
+      }
+      g.itens.push(v)
+      g.total += v.total
+      if (!v.paid) g.aReceber += v.total - v.paidAmount
+      if (v.paid && !v.annotated) g.faltaAnotar += 1
+      if (v.soldAt > g.ultima) g.ultima = v.soldAt
+      mapa.set(v.customerName, g)
+    }
+    return [...mapa.values()].sort((a, b) => b.ultima.localeCompare(a.ultima))
+  }, [sales])
+
+  const [clienteAberto, setClienteAberto] = useState<string | null>(null)
+
+  const paraCobrar = summary.filter((r) => r.devendoFechado > 0.004)
+  const proximos = summary.filter((r) => r.devendo - r.devendoFechado > 0.004)
+  const totalAReceber = paraCobrar.reduce((s, r) => s + r.devendoFechado, 0)
+  const totalProximo = proximos.reduce((s, r) => s + r.devendo - r.devendoFechado, 0)
+  // o que um fechamento agora levaria: sem fechamento ainda, e tudo o que esta em aberto
+  const aFechar = usaFechamento
+    ? { vendas: proximos.reduce((s, r) => s + r.vendasAbertas - r.vendasFechadas, 0), valor: totalProximo }
+    : { vendas: summary.reduce((s, r) => s + r.vendasAbertas, 0), valor: summary.reduce((s, r) => s + r.devendo, 0) }
+
+  const fazerFechamento = async () => {
+    if (!estab.id || aFechar.vendas === 0) return
+    if (!confirm(`Fazer o fechamento?\n\n${aFechar.vendas} venda(s) em aberto, ${brl(aFechar.valor)}, vão para a cobrança.`
+      + '\nO que for vendido depois fica para o próximo fechamento.')) return
+    setFechando(true)
+    try { await fecharFiado(estab.id); setAbertas(null); setAbertoId(null); await carregar() }
+    catch (e) { alert(e instanceof Error ? e.message : 'Erro ao fechar') }
+    finally { setFechando(false) }
+  }
+
+  /**
+   * Cartao de uma venda com todas as acoes: dar baixa, anotar na planilha,
+   * abater um valor parcial e excluir. Fica dentro do dropdown de cada pessoa
+   * em "A receber", e tambem nas abas de pagos.
+   * E funcao comum (nao componente) de proposito: assim o React nao remonta
+   * o cartao a cada tecla digitada no campo de valor parcial.
+   */
+  const cartaoVenda = (v: TabSale) => (
+              <div key={v.id} className={`bg-surface rounded-xl border p-3 shadow-card ${v.paid ? 'border-success-line' : 'border-line'}`}>
+                <div className="flex items-start justify-between gap-2">
+                  <div className="min-w-0 flex-1">
+                    <div className="flex items-center gap-2 flex-wrap">
+                      <span className="font-semibold text-ink text-sm">{v.customerName}</span>
+                      {!v.paid ? (
+                        <span className="text-[11px] font-bold text-brand bg-brand-soft px-2 py-0.5 rounded-full">A RECEBER</span>
+                      ) : v.annotated ? (
+                        <span className="text-[11px] font-bold text-ink-2 bg-surface-2 px-2 py-0.5 rounded-full">
+                          PAGO E ANOTADO
+                        </span>
+                      ) : (
+                          <span className="text-[11px] font-bold text-info bg-info-bg px-2 py-0.5 rounded-full">
+                            PAGO - FALTA ANOTAR
+                          </span>
+                        )}
+                      </div>
+                      <p className="text-xs text-ink-2 mt-1">
+                        {v.items.map((i) => `${i.quantity}x ${i.productName.replace('Cookie ', '')}`).join(', ')}
+                      </p>
+                      <p className="text-[11px] text-ink-3 mt-0.5 flex items-center gap-1">
+                        <CalendarDays size={11} /> {dataBR(v.soldAt)}
+                      </p>
+                      {v.paid && (
+                        editandoPagamento === v.id ? (
+                          <form className="mt-2 flex flex-wrap items-end gap-2" onSubmit={(e) => { e.preventDefault(); salvarDataPagamento(v) }}>
+                            <label className="min-w-0 text-xs text-ink-2">
+                              Data do pagamento
+                              <input type="date" required min={v.soldAt} max={hoje()} value={dataPagamento}
+                                onChange={(e) => setDataPagamento(e.target.value)} disabled={salvandoPagamento}
+                                className="mt-1 block max-w-full rounded-lg border border-line bg-surface px-2 py-1.5 text-sm text-ink" />
+                            </label>
+                            <button type="submit" disabled={salvandoPagamento}
+                              className="rounded-lg bg-success-bg px-3 py-2 text-xs font-semibold text-success disabled:opacity-50">
+                              {salvandoPagamento ? 'Salvando…' : 'Salvar'}
+                            </button>
+                            <button type="button" disabled={salvandoPagamento} onClick={() => setEditandoPagamento(null)}
+                              className="rounded-lg px-2 py-2 text-xs text-ink-2 disabled:opacity-50">Cancelar</button>
+                          </form>
+                        ) : (
+                          <button type="button" onClick={() => {
+                            setDataPagamento(diaEmBrasilia(v.paidAt) ?? hoje())
+                            setEditandoPagamento(v.id)
+                          }} title="Editar data do pagamento"
+                            className="mt-1 flex items-center gap-1 text-left text-[11px] text-success underline decoration-dotted underline-offset-4">
+                            <CalendarDays size={11} /> Pago em {dataBR(diaEmBrasilia(v.paidAt))} · editar
+                          </button>
+                        )
+                      )}
+                    </div>
+                    <div className="flex flex-col items-end gap-1.5 flex-shrink-0">
+                      <div className="text-right leading-tight">
+                        <span className="font-bold text-brand tabular-nums">{brl(v.total)}</span>
+                        {!v.paid && v.paidAmount > 0 && (
+                          <p className="text-[10px] text-ink-3 tabular-nums mt-0.5">
+                            pago {brl(v.paidAmount)} · falta{' '}
+                            <span className="font-bold text-brand">{brl(v.total - v.paidAmount)}</span>
+                          </p>
+                        )}
+                      </div>
+                      {parcialId === v.id ? (
+                        <div className="flex items-center gap-1">
+                          <span className="text-[11px] text-ink-3">R$</span>
+                          <input
+                            type="number" step="0.01" min="0" inputMode="decimal" autoFocus
+                            value={valorParcial}
+                            onChange={(e) => setValorParcial(e.target.value)}
+                            onKeyDown={(e) => {
+                              if (e.key === 'Enter') registrarParcial(v)
+                              if (e.key === 'Escape') fecharParcial()
+                            }}
+                            placeholder={(v.total - v.paidAmount).toFixed(2)}
+                            className="no-spinner w-20 border border-line rounded-md px-2 py-1 text-sm text-right tabular-nums focus:outline-none focus:border-brand" />
+                          <button onClick={() => registrarParcial(v)} disabled={salvandoParcial}
+                            title="Abater esse valor"
+                            className="w-7 h-7 rounded-full bg-success-bg text-success hover:bg-success-line flex items-center justify-center transition-colors disabled:opacity-50">
+                            <Check size={14} strokeWidth={3} />
+                          </button>
+                          <button onClick={fecharParcial} title="Cancelar"
+                            className="w-7 h-7 rounded-full text-ink-4 hover:bg-surface-2 flex items-center justify-center transition-colors">
+                            <X size={13} />
+                          </button>
+                        </div>
+                      ) : (
+                      <div className="flex items-center gap-1">
+                        <button onClick={async () => { await setTabSalePaid(v.id, !v.paid); await carregar() }}
+                          title={v.paid ? 'Marcar como não pago' : 'Marcar como pago'}
+                          className={`w-7 h-7 rounded-full flex items-center justify-center transition-colors ${
+                            v.paid ? 'bg-surface-2 text-ink-2 hover:bg-line' : 'bg-success-bg text-success hover:bg-success-line'
+                          }`}>
+                          {v.paid ? <Undo2 size={13} /> : <Check size={14} strokeWidth={3} />}
+                        </button>
+                        {v.paid && (
+                          <button onClick={async () => { await setTabSaleAnnotated(v.id, !v.annotated); await carregar() }}
+                            title={v.annotated ? 'Desmarcar anotado' : 'Marcar como anotado na planilha'}
+                            className={`w-7 h-7 rounded-full flex items-center justify-center transition-colors ${
+                              v.annotated ? 'bg-surface-2 text-ink-2 hover:bg-line'
+                                          : 'bg-info-bg text-info hover:bg-info-line'
+                            }`}>
+                            <NotebookPen size={13} />
+                          </button>
+                        )}
+                        {!v.paid && (
+                          <button onClick={() => { setParcialId(v.id); setValorParcial('') }}
+                            title="Recebeu só uma parte"
+                            className="w-7 h-7 rounded-full text-ink-4 hover:bg-brand-soft hover:text-brand flex items-center justify-center transition-colors">
+                            <HandCoins size={13} />
+                          </button>
+                        )}
+                        <button
+                          onClick={async () => {
+                            if (!confirm(`Excluir a venda de ${v.customerName} (${brl(v.total)})?`)) return
+                            await deleteTabSale(v.id); await carregar(); onEstoqueMudou?.()
+                          }}
+                          title="Excluir"
+                          className="w-7 h-7 rounded-full text-ink-4 hover:bg-danger-bg hover:text-danger flex items-center justify-center transition-colors">
+                          <Trash2 size={13} />
+                        </button>
+                      </div>
+                    )}
+                  </div>
+                </div>
+              </div>
+  )
+
+  return (
+    <div className="space-y-4">
+      {/* ---------- Produção levada para vender (vale para todos os lugares) ---------- */}
+      <Producao products={products} recarregar={versao} onEstoqueMudou={onEstoqueMudou}
+        onLote={(l) => setNoLote(Object.fromEntries((l?.itens ?? []).map((i) => [i.productId, Math.max(0, i.restante)])))} />
+
+      {/* ---------- Estabelecimento ---------- */}
+      <SeletorEstabelecimento
+        lista={estab.lista}
+        id={estab.id}
+        onEscolher={estab.escolher}
+        onMudou={async (novoId) => {
+          await estab.recarregar()
+          if (novoId) estab.escolher(novoId)
+        }}
+      />
+
+      {/* ---------- Registrar venda ---------- */}
+      <div className="bg-surface rounded-xl border border-line p-4 shadow-card">
+        <h3 className="font-display font-bold text-ink mb-3">Registrar venda</h3>
+
+        {/* Pessoa */}
+        <label className="block text-xs text-ink-2 mb-1">Pessoa</label>
+        <div className="mb-3">
+          <SeletorCliente
+            customers={customers}
+            value={pessoaId}
+            onChange={setPessoaId}
+            onCreate={async (nome) => {
+              const nova = await createTabCustomer(nome, undefined, undefined, estab.id ?? undefined)
+              await carregar()
+              setPessoaId(nova.id)
+            }}
+            placeholder="Buscar pessoa pelo nome..."
+          />
+        </div>
+
+        {/* Cookies */}
+        <div className="grid grid-cols-2 sm:grid-cols-3 gap-2 mb-3">
+          {products.map((p) => {
+            const q = qtds[p.id] ?? 0
+            return (
+              <div key={p.id} className={`rounded-lg border p-2 transition-colors ${
+                q > 0 ? 'border-brand bg-brand-soft' : 'border-line'
+              }`}>
+                <p className="text-xs font-semibold text-ink truncate">{p.name.replace('Cookie ', '')}</p>
+                <p className="text-[11px] text-ink-3">{brl(p.price)}</p>
+                <div className="mb-1.5"><EstoqueDoSabor p={p} qtd={q} noLote={noLote[p.id] ?? 0} /></div>
+                <div className="flex items-center justify-between">
+                  <button onClick={() => mudarQtd(p.id, -1)} disabled={q === 0}
+                    className="w-7 h-7 rounded-full bg-surface border border-line text-brand flex items-center justify-center disabled:opacity-30"
+                    aria-label={`Tirar 1 ${p.name}`}><Minus size={12} strokeWidth={2.5} /></button>
+                  <span className="text-sm font-bold tabular-nums w-5 text-center">{q}</span>
+                  <button onClick={() => mudarQtd(p.id, 1)}
+                    className="w-7 h-7 rounded-full bg-brand text-brand-ink flex items-center justify-center"
+                    aria-label={`Adicionar 1 ${p.name}`}><Plus size={12} strokeWidth={2.5} /></button>
+                </div>
+              </div>
+            )
+          })}
+        </div>
+        <div className="-mt-1 mb-3 empty:hidden"><AvisoEstoque products={products} qtds={qtdsComTrocas} noLote={noLote} /></div>
+
+        <div className="flex flex-wrap items-center gap-3">
+          <div>
+            <label className="block text-xs text-ink-2 mb-1">Data</label>
+            <input type="date" value={data} onChange={(e) => setData(e.target.value)}
+              className="border border-line rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-brand" />
+          </div>
+          <label className="flex items-center gap-2 text-sm text-ink-2 cursor-pointer mt-5">
+            <input type="checkbox" checked={jaPago} onChange={(e) => setJaPago(e.target.checked)}
+              className="w-4 h-4 accent-success-solid" />
+            Já pagou
+          </label>
+          {pessoaId && pontosDe(pessoaId) > 0 && (
+            <div className="mt-5 flex flex-wrap items-center gap-1.5 min-w-0">
+              <span className="flex items-center gap-1 text-xs font-semibold text-brand">
+                <Gift size={14} /> {pontosLivres} pts
+              </span>
+              {resgates.map((id, n) => {
+                const p = products.find((x) => x.id === id)
+                return (
+                  <button key={`${id}-${n}`} type="button" title="Tirar a troca"
+                    onClick={() => setResgates((r) => r.filter((_, j) => j !== n))}
+                    className="flex items-center gap-1 text-xs font-semibold px-2 py-1 rounded-full bg-success-bg border border-success-line text-success">
+                    1 {p?.name.replace('Cookie ', '')} grátis <X size={11} />
+                  </button>
+                )
+              })}
+              {cookiesQueDa.length > 0 ? cookiesQueDa.map((p) => (
+                <button key={p.id} type="button" onClick={() => setResgates((r) => [...r, p.id])}
+                  title={`Sai de graça por ${custoDe(p.id)} pontos`}
+                  className="text-xs font-semibold px-2 py-1 rounded-full border border-dashed border-brand-line text-brand hover:bg-brand-soft transition-colors">
+                  + {p.name.replace('Cookie ', '')} · {custoDe(p.id)}
+                </button>
+              )) : !resgates.length && (
+                <span className="text-[11px] text-ink-3">ainda não dá para trocar ({custoMinimo - pontosLivres} pts para um cookie)</span>
+              )}
+            </div>
+          )}
+          <div className="flex items-center gap-3 ml-auto mt-5">
+            <span className="font-bold text-brand text-lg tabular-nums">{brl(totalCarrinho)}</span>
+            <button onClick={registrar} disabled={salvando}
+              className="bg-brand hover:bg-brand-strong text-brand-ink font-bold px-5 py-2.5 rounded-lg text-sm transition-colors disabled:opacity-50">
+              {salvando ? 'Salvando...' : 'Registrar'}
+            </button>
+          </div>
+        </div>
+      </div>
+
+      {/* ---------- A receber: o fechado entra na cobranca ---------- */}
+      {(paraCobrar.length > 0 || aFechar.vendas > 0) && (
+        <div className="bg-surface rounded-xl border border-line p-4 shadow-card">
+          <div className="flex items-start justify-between gap-3 mb-3">
+            <div className="min-w-0">
+              <h3 className="font-display font-bold text-ink">A receber</h3>
+              {fechamento && (
+                <p className="text-[11px] text-ink-3 mt-0.5">
+                  Fechamento de {dataBR(diaEmBrasilia(fechamento.fechadoEm))} · é isso que vai na cobrança
+                </p>
+              )}
+            </div>
+            <span className="text-lg font-bold text-danger tabular-nums flex-shrink-0">{brl(totalAReceber)}</span>
+          </div>
+          {paraCobrar.length === 0 ? (
+            <p className="text-xs text-ink-3 py-1">Nada do fechamento ficou em aberto.</p>
+          ) : (
+          <div className="space-y-1.5">
+            {paraCobrar.map((r) => {
+              const aberto = abertoId === r.customerId
+              const vendas = vendasDe(r.customerId)
+              return (
+              <div key={r.customerId} className="border-b border-line-soft last:border-0">
+                <div className="flex items-center justify-between gap-2 py-1.5">
+                  <button
+                    onClick={() => alternarVendas(r.customerId)}
+                    aria-expanded={aberto}
+                    title={`Ver as vendas de ${r.customerName}`}
+                    className="group min-w-0 flex items-center gap-1.5 text-left -ml-1 px-1 py-0.5 rounded-md hover:bg-surface-2 transition-colors">
+                    <ChevronRight
+                      size={13}
+                      className={`flex-shrink-0 text-ink-3 transition-transform duration-200 ${aberto ? 'rotate-90 text-brand' : ''}`} />
+                    <span className="text-sm text-ink truncate group-hover:text-brand transition-colors">{r.customerName}</span>
+                    <span className="text-[11px] text-ink-3 flex-shrink-0">({r.vendasFechadas}x)</span>
+                    {pontosDe(r.customerId) > 0 && (
+                      <span title="Pontos de fidelidade" className="flex items-center gap-0.5 text-[11px] font-semibold text-brand flex-shrink-0">
+                        <Gift size={11} /> {pontosDe(r.customerId)}
+                      </span>
+                    )}
+                  </button>
+                  <div className="flex items-center gap-2 flex-shrink-0">
+                    <span className="text-sm font-bold text-ink tabular-nums">{brl(r.devendoFechado)}</span>
+                    {r.phone ? (
+                      <a
+                        href={linkWhatsApp(r)}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        onClick={() => { markCharged(r.customerId).catch(() => {}) }}
+                        title={`Abrir a conversa de ${r.customerName} no WhatsApp com a cobrança`}
+                        className="w-8 h-7 rounded-md border border-success-line bg-success-bg text-success hover:bg-success-bg flex items-center justify-center transition-colors">
+                        <WhatsAppIcon size={14} />
+                      </a>
+                    ) : (
+                      <button
+                        onClick={() => copiarCobranca(r)}
+                        title={`${r.customerName} não tem WhatsApp cadastrado — copiar a mensagem`}
+                        className={`w-8 h-7 rounded-md border flex items-center justify-center transition-colors ${
+                          copiadoId === r.customerId
+                            ? 'text-success bg-success-bg border-success-line'
+                            : 'text-brand bg-brand-soft hover:bg-brand-line border-brand-line'
+                        }`}>
+                        {copiadoId === r.customerId
+                          ? <Check size={14} strokeWidth={3} />
+                          : <MessageCircle size={14} />}
+                      </button>
+                    )}
+                    <button
+                      onClick={async () => {
+                        if (!confirm(`Marcar como pago o que ${r.customerName} deve${usaFechamento ? ' do fechamento' : ''} (${brl(r.devendoFechado)})?`)) return
+                        await payAllForCustomer(r.customerId); await carregar()
+                      }}
+                      className="text-xs font-semibold text-success bg-success-bg hover:bg-success-bg border border-success-line px-2.5 py-1 rounded-md transition-colors">
+                      Quitar
+                    </button>
+                  </div>
+                </div>
+
+                {aberto && (
+                  <div className="pb-2 pl-[18px] animate-fade-up">
+                    {buscandoVendas ? (
+                      <div className="py-2 flex justify-center">
+                        <Loader2 size={14} className="animate-spin text-brand" />
+                      </div>
+                    ) : vendas.length === 0 ? (
+                      <p className="text-[11px] text-ink-3 py-1.5">Nenhuma venda em aberto.</p>
+                    ) : (
+                      <div className="space-y-2">
+                        {vendas.map((v) => cartaoVenda(v))}
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
+              )
+            })}
+          </div>
+          )}
+
+          {/* Fechar: o que esta em aberto e ainda nao foi fechado passa para a cobranca */}
+          {aFechar.vendas > 0 && (
+            <div className="mt-3 pt-3 border-t border-line-soft flex items-center justify-between gap-3">
+              <p className="text-[11px] text-ink-2">
+                {usaFechamento
+                  ? `${aFechar.vendas} venda(s) depois do fechamento (${brl(aFechar.valor)}).`
+                  : `Fechar leva as ${aFechar.vendas} venda(s) em aberto para a cobrança; o que vender depois fica para o próximo.`}
+              </p>
+              <button onClick={fazerFechamento} disabled={fechando}
+                className="flex-shrink-0 flex items-center gap-1.5 text-xs font-bold text-brand-ink bg-brand hover:bg-brand-strong px-3 py-2 rounded-lg transition-colors disabled:opacity-50">
+                <Lock size={13} /> {fechando ? 'Fechando...' : 'Fazer fechamento'}
+              </button>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* ---------- Depois do fechamento: fica para a proxima cobranca ---------- */}
+      {usaFechamento && proximos.length > 0 && (
+        <div className="bg-surface rounded-xl border border-dashed border-line p-4">
+          <div className="flex items-start justify-between gap-3 mb-3">
+            <div className="min-w-0">
+              <h3 className="font-display font-bold text-ink">Próximo fechamento</h3>
+              <p className="text-[11px] text-ink-3 mt-0.5">Vendido depois do fechamento · ainda não entra na cobrança</p>
+            </div>
+            <span className="text-lg font-bold text-ink-2 tabular-nums flex-shrink-0">{brl(totalProximo)}</span>
+          </div>
+          <div className="space-y-1.5">
+            {proximos.map((r) => {
+              const aberto = abertoProx === r.customerId
+              const vendas = vendasDe(r.customerId, true)
+              return (
+              <div key={r.customerId} className="border-b border-line-soft last:border-0">
+                <div className="flex items-center justify-between gap-2 py-1.5">
+                  <button
+                    onClick={() => alternarVendas(r.customerId, true)}
+                    aria-expanded={aberto}
+                    title={`Ver as vendas de ${r.customerName}`}
+                    className="group min-w-0 flex items-center gap-1.5 text-left -ml-1 px-1 py-0.5 rounded-md hover:bg-surface-2 transition-colors">
+                    <ChevronRight
+                      size={13}
+                      className={`flex-shrink-0 text-ink-3 transition-transform duration-200 ${aberto ? 'rotate-90 text-brand' : ''}`} />
+                    <span className="text-sm text-ink truncate group-hover:text-brand transition-colors">{r.customerName}</span>
+                    <span className="text-[11px] text-ink-3 flex-shrink-0">({r.vendasAbertas - r.vendasFechadas}x)</span>
+                  </button>
+                  <span className="text-sm font-bold text-ink-2 tabular-nums flex-shrink-0">{brl(r.devendo - r.devendoFechado)}</span>
+                </div>
+
+                {aberto && (
+                  <div className="pb-2 pl-[18px] animate-fade-up">
+                    {buscandoVendas ? (
+                      <div className="py-2 flex justify-center">
+                        <Loader2 size={14} className="animate-spin text-brand" />
+                      </div>
+                    ) : vendas.length === 0 ? (
+                      <p className="text-[11px] text-ink-3 py-1.5">Nenhuma venda em aberto.</p>
+                    ) : (
+                      <div className="space-y-2">
+                        {vendas.map((v) => cartaoVenda(v))}
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
+              )
+            })}
+          </div>
+        </div>
+      )}
+      {/* ---------- Histórico ---------- */}
+      <div>
+        <div className="flex gap-2 mb-3">
+          {([
+            { v: 'open' as TabStatus, label: 'A receber' },
+            { v: 'all' as TabStatus, label: 'Todas' },
+          ]).map(({ v, label }) => (
+            <button key={v} onClick={() => setFiltro(v)}
+              className={`px-4 py-1.5 rounded-full text-xs font-semibold border transition-colors ${
+                filtro === v ? 'bg-brand text-brand-ink border-brand'
+                             : 'bg-surface text-ink-2 border-line hover:border-brand'
+              }`}>{label}</button>
+          ))}
+        </div>
+
+        {loading ? (
+          <div className="flex justify-center py-10"><Loader2 size={26} className="animate-spin text-brand" /></div>
+        ) : filtro === 'open' ? (
+          <p className="text-center text-ink-3 py-8 text-sm">
+            As vendas em aberto ficam dentro de cada pessoa, ali em cima no “A receber”.
+          </p>
+        ) : sales.length === 0 ? (
+          <p className="text-center text-ink-3 py-10 text-sm">Nenhuma venda aqui.</p>
+        ) : (
+          <div className="space-y-2">
+            {porCliente.map((g) => {
+              const aberto = clienteAberto === g.nome
+              return (
+                <div key={g.nome} className="bg-surface rounded-xl border border-line shadow-card overflow-hidden">
+                  <button
+                    onClick={() => setClienteAberto(aberto ? null : g.nome)}
+                    aria-expanded={aberto}
+                    className="w-full flex items-center gap-2.5 p-3 text-left hover:bg-surface-2 transition-colors group">
+                    <ChevronRight size={14}
+                      className={`flex-shrink-0 text-ink-3 transition-transform duration-200 ${aberto ? 'rotate-90 text-brand' : ''}`} />
+                    <span className="font-semibold text-ink text-sm truncate flex-1 min-w-0 group-hover:text-brand transition-colors">
+                      {g.nome}
+                    </span>
+                    {g.aReceber > 0 && (
+                      <span className="flex-shrink-0 text-[11px] font-bold text-brand bg-brand-soft px-2 py-0.5 rounded-full tabular-nums">
+                        deve {brl(g.aReceber)}
+                      </span>
+                    )}
+                    {g.faltaAnotar > 0 && (
+                      <span className="flex-shrink-0 text-[11px] font-bold text-info bg-info-bg px-2 py-0.5 rounded-full tabular-nums">
+                        {g.faltaAnotar} a anotar
+                      </span>
+                    )}
+                    <span className="text-[11px] text-ink-3 flex-shrink-0 tabular-nums">
+                      {g.itens.length}x
+                    </span>
+                    <span className="font-bold text-brand tabular-nums flex-shrink-0 w-20 text-right">
+                      {brl(g.total)}
+                    </span>
+                  </button>
+
+                  {aberto && (
+                    <div className="p-3 pt-0 space-y-2 animate-fade-up bg-surface-2 border-t border-line-soft">
+                      <div className="pt-2 space-y-2">
+                        {g.itens.map((v) => cartaoVenda(v))}
+                      </div>
+                    </div>
+                  )}
+                </div>
+              )
+            })}
+          </div>
+        )}
+      </div>
+    </div>
+  )
+}

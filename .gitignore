@@ -1,0 +1,16 @@
+# Segredos — NUNCA subir para o GitHub
+.env
+frontend/.env
+
+# Node
+frontend/node_modules/
+frontend/dist/
+
+# Logs
+logs/
+*.log
+
+# IDEs
+.idea/
+*.iml
+.vscode/
